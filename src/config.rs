@@ -15,10 +15,6 @@ pub struct Config {
     pub gcp_project_id: Option<String>,
     pub gcp_zone: String,
 
-    // Local baremetal
-    pub baremetal_host: Option<String>,
-    pub baremetal_user: String,
-
     // DD fleet
     pub dd_register_url: String,
     pub dd_binary_url: String,
@@ -56,9 +52,6 @@ impl Config {
 
             gcp_project_id: env::var("GCP_PROJECT_ID").ok(),
             gcp_zone: env::var("GCP_ZONE").unwrap_or_else(|_| "us-central1-c".into()),
-
-            baremetal_host: env::var("BAREMETAL_HOST").ok(),
-            baremetal_user: env::var("BAREMETAL_USER").unwrap_or_else(|_| "tdx2".into()),
 
             dd_register_url: env::var("DD_REGISTER_URL")
                 .unwrap_or_else(|_| "wss://app.devopsdefender.com/register".into()),

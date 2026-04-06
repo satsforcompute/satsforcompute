@@ -19,29 +19,23 @@ pub async fn create_vm(
     size: &str,
     github_handle: &str,
 ) -> Result<(), String> {
-    let host = config
-        .baremetal_host
-        .as_deref()
-        .ok_or("BAREMETAL_HOST not configured")?;
-    let user = &config.baremetal_user;
     let register_url = &config.dd_register_url;
 
-    let cmd = format!(
-        "dd-vm.sh create --name {vm_name} --size {size} --env DD_OWNER={github_handle} --env DD_REGISTER_URL={register_url}"
-    );
-
-    let output = Command::new("ssh")
+    let output = Command::new("dd-vm.sh")
         .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{user}@{host}"),
-            &cmd,
+            "create",
+            "--name",
+            vm_name,
+            "--size",
+            size,
+            "--env",
+            &format!("DD_OWNER={github_handle}"),
+            "--env",
+            &format!("DD_REGISTER_URL={register_url}"),
         ])
         .output()
         .await
-        .map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|e| format!("dd-vm.sh failed: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -51,25 +45,12 @@ pub async fn create_vm(
     Ok(())
 }
 
-pub async fn destroy_vm(config: &Config, vm_name: &str) -> Result<(), String> {
-    let host = config
-        .baremetal_host
-        .as_deref()
-        .ok_or("BAREMETAL_HOST not configured")?;
-    let user = &config.baremetal_user;
-
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{user}@{host}"),
-            &format!("dd-vm.sh destroy --name {vm_name}"),
-        ])
+pub async fn destroy_vm(_config: &Config, vm_name: &str) -> Result<(), String> {
+    let output = Command::new("dd-vm.sh")
+        .args(["destroy", "--name", vm_name])
         .output()
         .await
-        .map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|e| format!("dd-vm.sh failed: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,32 +66,22 @@ pub async fn reassign_vm(
     vm_name: &str,
     github_handle: &str,
 ) -> Result<(), String> {
-    let host = config
-        .baremetal_host
-        .as_deref()
-        .ok_or("BAREMETAL_HOST not configured")?;
-    let user = &config.baremetal_user;
     let register_url = &config.dd_register_url;
 
     // Get the VM's IP, SSH in, kill old dd-agent, restart with new owner
-    let cmd = format!(
-        r#"VM_IP=$(virsh domifaddr dd-vm-{vm_name} 2>/dev/null | grep -oP '(\d+\.)+\d+' | head -1) && \
-        ssh -o StrictHostKeyChecking=no "root@$VM_IP" \
-        'pkill dd-agent; sleep 1; DD_OWNER={github_handle} DD_REGISTER_URL={register_url} nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &'"#
+    let script = format!(
+        r#"set -e
+VM_IP=$(virsh domifaddr dd-vm-{vm_name} 2>/dev/null | grep -oP '(\d+\.)+\d+' | head -1)
+[ -n "$VM_IP" ] || exit 1
+ssh -o StrictHostKeyChecking=no "root@$VM_IP" \
+  'pkill dd-agent; sleep 1; DD_OWNER={github_handle} DD_REGISTER_URL={register_url} nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &'"#
     );
 
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{user}@{host}"),
-            &cmd,
-        ])
+    let output = Command::new("bash")
+        .args(["-c", &script])
         .output()
         .await
-        .map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|e| format!("reassign failed: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -120,25 +91,12 @@ pub async fn reassign_vm(
     Ok(())
 }
 
-pub async fn check_capacity(config: &Config) -> Result<bool, String> {
-    let host = match config.baremetal_host.as_deref() {
-        Some(h) => h,
-        None => return Ok(false),
-    };
-    let user = &config.baremetal_user;
-
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{user}@{host}"),
-            "virsh list --all | grep -c 'dd-vm-' || echo 0",
-        ])
+pub async fn check_capacity(_config: &Config) -> Result<bool, String> {
+    let output = Command::new("bash")
+        .args(["-c", "virsh list --all | grep -c 'dd-vm-' || echo 0"])
         .output()
         .await
-        .map_err(|e| format!("ssh failed: {e}"))?;
+        .map_err(|e| format!("virsh failed: {e}"))?;
 
     let count: i64 = String::from_utf8_lossy(&output.stdout)
         .trim()
