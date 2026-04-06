@@ -14,9 +14,7 @@ permissions:
   packages: write
 
 env:
-  SSH_HOST: 162.222.34.121
-  SSH_USER: tdx2
-  DD_DOMAIN: devopsdefender.com
+  AGENT_URL: https://app-staging.devopsdefender.com
   IMAGE: ghcr.io/satsforcompute/satsforcompute:latest
 
 jobs:
@@ -36,52 +34,31 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    environment: staging
     steps:
-      - name: Set up SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BAREMETAL_SSH_KEY }}" > /tmp/deploy-key
-          chmod 600 /tmp/deploy-key
-          ssh-keyscan -H ${SSH_HOST} >> ~/.ssh/known_hosts 2>/dev/null || true
-
-      - name: Find staging VM IP
-        id: vm
-        run: |
-          SSH="ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
-          VM_MAC=$($SSH "sudo virsh domiflist dd-vm-staging | awk '/virbr0/ {print \$5}'")
-          VM_IP=$($SSH "sudo virsh net-dhcp-leases default | grep '$VM_MAC' | awk '{print \$5}' | cut -d/ -f1")
-          [ -z "$VM_IP" ] && { echo "::error::Staging VM not running"; exit 1; }
-          echo "vm_ip=${VM_IP}" >> "$GITHUB_OUTPUT"
-          echo "Staging VM IP: ${VM_IP}"
-
       - name: Deploy BTCPay Server
         env:
           DD_PASSWORD: ${{ secrets.DD_PASSWORD }}
         run: |
-          SSH="ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
-          API="http://${{ steps.vm.outputs.vm_ip }}:8080"
-          AUTH="Authorization: Bearer ${DD_PASSWORD}"
-
           # Check if btcpay is already running
-          existing=$($SSH "curl -fsS ${API}/deployments -H '${AUTH}'" 2>/dev/null) || true
+          existing=$(curl -fsS "${AGENT_URL}/deployments" \
+            -H "Authorization: Bearer ${DD_PASSWORD}" 2>/dev/null) || true
           if echo "$existing" | jq -e '.[] | select(.app_name=="btcpay" and .status=="running")' >/dev/null 2>&1; then
             echo "BTCPay Server already running, skipping"
           else
             echo "Deploying BTCPay Server..."
-            $SSH "curl -fsS -X POST ${API}/deploy \
-              -H 'Content-Type: application/json' \
-              -H '${AUTH}' \
+            curl -fsS -X POST "${AGENT_URL}/deploy" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${DD_PASSWORD}" \
               -d '{
-                \"image\": \"btcpayserver/btcpayserver:latest\",
-                \"app_name\": \"btcpay\",
-                \"env\": [
-                  \"BTCPAY_HOST=localhost\",
-                  \"BTCPAY_PROTOCOL=http\",
-                  \"BTCPAY_ROOTPATH=/\"
+                "image": "btcpayserver/btcpayserver:latest",
+                "app_name": "btcpay",
+                "env": [
+                  "BTCPAY_HOST=localhost",
+                  "BTCPAY_PROTOCOL=http",
+                  "BTCPAY_ROOTPATH=/"
                 ],
-                \"volumes\": [\"/var/lib/dd/shared/btcpay:/datadir\"]
-              }'"
+                "volumes": ["/var/lib/dd/shared/btcpay:/datadir"]
+              }'
             echo "BTCPay Server deployed"
           fi
 
@@ -93,15 +70,11 @@ jobs:
           BTCPAY_STORE_ID: ${{ secrets.BTCPAY_STORE_ID }}
           BTCPAY_WEBHOOK_SECRET: ${{ secrets.BTCPAY_WEBHOOK_SECRET }}
         run: |
-          SSH="ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
-          API="http://${{ steps.vm.outputs.vm_ip }}:8080"
-          AUTH="Authorization: Bearer ${DD_PASSWORD}"
-
           echo "Deploying satsforcompute..."
-          result=$($SSH "curl -fsS -X POST ${API}/deploy \
-            -H 'Content-Type: application/json' \
-            -H '${AUTH}' \
-            -d '{
+          result=$(curl -fsS -X POST "${AGENT_URL}/deploy" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${DD_PASSWORD}" \
+            -d "{
               \"image\": \"${IMAGE}\",
               \"app_name\": \"satsforcompute\",
               \"env\": [
@@ -117,12 +90,13 @@ jobs:
                 \"DD_MARKET_POOL_INTERVAL_SECS=1800\"
               ],
               \"volumes\": [\"/var/lib/dd/shared:/var/lib/dd/shared\"]
-            }'")
+            }")
           echo "Deploy result: $result"
 
           DEPLOY_ID=$(echo "$result" | jq -r .id)
           for i in $(seq 1 60); do
-            dep=$($SSH "curl -fsS ${API}/deployments/${DEPLOY_ID} -H '${AUTH}'" 2>/dev/null) || true
+            dep=$(curl -fsS "${AGENT_URL}/deployments/${DEPLOY_ID}" \
+              -H "Authorization: Bearer ${DD_PASSWORD}" 2>/dev/null) || true
             status=$(echo "$dep" | jq -r .status 2>/dev/null) || true
             if [ "$status" = "running" ]; then
               echo "satsforcompute deployed successfully"
@@ -134,22 +108,3 @@ jobs:
             [ "$i" -eq 60 ] && { echo "::error::Deploy timed out"; exit 1; }
             sleep 5
           done
-
-      - name: Health check
-        run: |
-          SSH="ssh -i /tmp/deploy-key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
-          VM_IP="${{ steps.vm.outputs.vm_ip }}"
-          for i in $(seq 1 12); do
-            health=$($SSH "curl -fsS http://${VM_IP}:8082/health" 2>/dev/null) || true
-            if [ -n "$health" ]; then
-              echo "satsforcompute healthy: $health"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::error::Health check failed"
-          exit 1
-
-      - name: Cleanup
-        if: always()
-        run: rm -f /tmp/deploy-key
