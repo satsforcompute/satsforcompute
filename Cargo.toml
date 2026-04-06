@@ -1,0 +1,23 @@
+[package]
+name = "dd-market"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dd-market"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["serde", "v4"] }
