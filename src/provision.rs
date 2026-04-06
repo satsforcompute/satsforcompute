@@ -82,7 +82,6 @@ pub async fn provision_order(db: &Db, config: &Config, order: &Order) {
                 tracing::warn!("local at capacity, falling back to GCP");
                 let script = gcp::generate_startup_script(config, &order.github_handle, &vm_name);
                 let r = gcp::create_instance(
-                    &reqwest::Client::new(),
                     config,
                     &vm_name,
                     "c3-standard-4",
@@ -97,7 +96,6 @@ pub async fn provision_order(db: &Db, config: &Config, order: &Order) {
         Provider::Gcp => {
             let script = gcp::generate_startup_script(config, &order.github_handle, &vm_name);
             let r = gcp::create_instance(
-                &reqwest::Client::new(),
                 config,
                 &vm_name,
                 &plan.machine_type,

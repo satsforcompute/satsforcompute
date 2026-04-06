@@ -20,14 +20,13 @@ async fn check_expirations(db: &Db, config: &Config) -> Result<(), String> {
     }
 
     tracing::info!(count = expired.len(), "processing expired nodes");
-    let client = reqwest::Client::new();
 
     for node in expired {
         tracing::info!(node_id = %node.id, vm = %node.vm_name, "tearing down expired node");
 
         let result = match node.provider {
             Provider::Local => local::destroy_vm(config, &node.vm_name).await,
-            Provider::Gcp => gcp::delete_instance(&client, config, &node.vm_name).await,
+            Provider::Gcp => gcp::delete_instance(config, &node.vm_name).await,
         };
 
         match result {

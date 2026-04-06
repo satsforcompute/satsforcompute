@@ -206,16 +206,8 @@ async fn execute_action(db: &Db, config: &Config, action: &PoolAction) -> Result
                         _ => "c3-standard-4",
                     };
                     let script = gcp::generate_startup_script(config, "unclaimed", &vm_name);
-                    gcp::create_instance(
-                        &reqwest::Client::new(),
-                        config,
-                        &vm_name,
-                        machine_type,
-                        256,
-                        &script,
-                        "unclaimed",
-                    )
-                    .await?;
+                    gcp::create_instance(config, &vm_name, machine_type, 256, &script, "unclaimed")
+                        .await?;
                 }
             }
 
@@ -256,8 +248,7 @@ async fn execute_action(db: &Db, config: &Config, action: &PoolAction) -> Result
                         local::destroy_vm(config, &node.vm_name).await?;
                     }
                     Provider::Gcp => {
-                        gcp::delete_instance(&reqwest::Client::new(), config, &node.vm_name)
-                            .await?;
+                        gcp::delete_instance(config, &node.vm_name).await?;
                     }
                 }
                 db::update_node_status(db, &node.id, NodeStatus::Deleted);

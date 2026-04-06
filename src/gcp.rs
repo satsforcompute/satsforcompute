@@ -3,11 +3,6 @@ use serde::Deserialize;
 use crate::config::Config;
 
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct Operation {
     #[serde(default)]
     #[allow(dead_code)]
@@ -26,21 +21,19 @@ struct ErrorDetail {
     message: String,
 }
 
-pub async fn get_access_token(client: &reqwest::Client) -> Result<String, String> {
-    // Try GCP metadata server first (running on GCP VM)
-    let resp = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await;
+pub async fn get_access_token() -> Result<String, String> {
+    let output = tokio::process::Command::new("gcloud")
+        .args(["auth", "print-access-token"])
+        .output()
+        .await
+        .map_err(|e| format!("gcloud failed: {e}"))?;
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let token: TokenResponse = r.json().await.map_err(|e| e.to_string())?;
-            Ok(token.access_token)
-        }
-        _ => Err("not running on GCP and no credentials configured".into()),
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gcloud auth failed: {stderr}"));
     }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn generate_startup_script(config: &Config, github_handle: &str, vm_name: &str) -> String {
@@ -88,7 +81,6 @@ nohup /usr/local/bin/dd-agent > /var/log/dd-agent.log 2>&1 &
 }
 
 pub async fn create_instance(
-    client: &reqwest::Client,
     config: &Config,
     vm_name: &str,
     machine_type: &str,
@@ -101,7 +93,8 @@ pub async fn create_instance(
         .as_deref()
         .ok_or("GCP_PROJECT_ID not configured")?;
     let zone = &config.gcp_zone;
-    let token = get_access_token(client).await?;
+    let token = get_access_token().await?;
+    let client = reqwest::Client::new();
 
     let body = serde_json::json!({
         "name": vm_name,
@@ -164,17 +157,14 @@ pub async fn create_instance(
     Ok(())
 }
 
-pub async fn delete_instance(
-    client: &reqwest::Client,
-    config: &Config,
-    vm_name: &str,
-) -> Result<(), String> {
+pub async fn delete_instance(config: &Config, vm_name: &str) -> Result<(), String> {
     let project = config
         .gcp_project_id
         .as_deref()
         .ok_or("GCP_PROJECT_ID not configured")?;
     let zone = &config.gcp_zone;
-    let token = get_access_token(client).await?;
+    let token = get_access_token().await?;
+    let client = reqwest::Client::new();
 
     let resp = client
         .delete(format!(
