@@ -44,6 +44,12 @@ pub struct Config {
     /// and labels — see `github.rs` for the exact REST surface used.
     /// Held only in process memory; never logged.
     pub github_token: String,
+    /// Shared bearer token gating the `/tools/*` API. Operator
+    /// frontends (OpenClaw, custom UI, etc.) present it as
+    /// `Authorization: Bearer <token>`. Single token per operator
+    /// for v0; multi-tenant tool-API auth (per-frontend tokens) is a
+    /// future cleanup.
+    pub tool_api_token: String,
 }
 
 impl Config {
@@ -58,6 +64,7 @@ impl Config {
         let price_per_24h_sats = parse_env("SATS_PRICE_PER_24H_SATS", "50000")?;
         let pending_timeout_secs = parse_env("SATS_PENDING_TIMEOUT_SECS", "10800")?;
         let github_token = require_env("SATS_GITHUB_TOKEN")?;
+        let tool_api_token = require_env("SATS_TOOL_API_TOKEN")?;
 
         if !state_repo.contains('/') {
             bail!("SATS_STATE_REPO must be 'owner/repo', got {state_repo:?}");
@@ -75,6 +82,7 @@ impl Config {
             price_per_24h_sats,
             pending_timeout_secs,
             github_token,
+            tool_api_token,
         })
     }
 }

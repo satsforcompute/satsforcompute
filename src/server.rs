@@ -6,12 +6,11 @@
 //!   verification step.
 //! - `GET /version` — build-time identifier so a third-party verifier
 //!   can correlate /health with a specific commit.
-//!
-//! Tool-API endpoints (claim.create, claim.load, btc.invoice, etc.)
-//! land in subsequent PRs. v0 ships the listener + config so the
-//! deploy pipeline has a working binary to wire up.
+//! - `POST /tools/<name>` — operator tool API (auth-gated, see
+//!   `tools::router`). First tool is `claim.create`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{Json, Router, http::StatusCode, routing::get};
@@ -20,20 +19,34 @@ use tracing::info;
 
 use crate::claim::CURRENT_SCHEMA;
 use crate::config::Config;
+use crate::github;
+use crate::tools;
 
 #[derive(Clone)]
 struct AppState {
-    cfg: Config,
+    cfg: Arc<Config>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
     let port = cfg.port;
-    let state = AppState { cfg };
+    let cfg_arc = Arc::new(cfg);
+
+    // Tool layer needs its own State_ because each tool handler reads
+    // the full config + the GitHub client. Health/version stay on a
+    // smaller AppState so they don't pull in the GitHub client.
+    let github = Arc::new(github::Client::new(cfg_arc.github_token.clone()));
+    let tool_state = tools::State_ {
+        cfg: cfg_arc.clone(),
+        github,
+    };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
-        .with_state(state);
+        .with_state(AppState {
+            cfg: cfg_arc.clone(),
+        })
+        .merge(tools::router(tool_state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, "satsforcompute: listening");
@@ -106,6 +119,7 @@ mod tests {
             price_per_24h_sats: 50_000,
             pending_timeout_secs: 10_800,
             github_token: "test-token".into(),
+            tool_api_token: "test-tool-token".into(),
         }
     }
 
@@ -113,7 +127,7 @@ mod tests {
         Router::new()
             .route("/healthz", get(healthz))
             .route("/version", get(version))
-            .with_state(AppState { cfg })
+            .with_state(AppState { cfg: Arc::new(cfg) })
     }
 
     #[tokio::test]
