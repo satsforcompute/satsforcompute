@@ -45,6 +45,7 @@ pub fn router(state: State_) -> Router {
         .route("/tools/claim.create", post(claim_create))
         .route("/tools/claim.load", post(claim_load))
         .route("/tools/claim.update", post(claim_update))
+        .route("/tools/btc.invoice", post(btc_invoice))
         .with_state(state)
 }
 
@@ -393,6 +394,127 @@ fn state_str(s: ClaimState) -> &'static str {
     }
 }
 
+// ── btc.invoice ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct BtcInvoiceReq {
+    pub issue_number: u64,
+    /// Number of 24-hour blocks to bill in this invoice. Defaults to
+    /// 1 (one day's access). Top-ups call `btc.invoice` again with
+    /// higher `blocks`; the bot tracks confirmed payments per claim
+    /// and credits each block.
+    #[serde(default = "default_blocks")]
+    pub blocks: u32,
+}
+
+fn default_blocks() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+pub struct BtcInvoiceResp {
+    pub address: String,
+    pub amount_sats: u64,
+    /// BTC amount as a decimal string suitable for BIP21 `amount=`
+    /// (no trailing zeros stripped — wallets accept either, and
+    /// fixed-width is easier on humans reading the URI).
+    pub amount_btc: String,
+    pub bip21_uri: String,
+    /// Plaintext message embedded as BIP21 `message=`. The bot uses
+    /// `claim_id` so a customer pasting the URI into a wallet sees
+    /// what they're paying for, and so the operator can attribute
+    /// payments to claims via the wallet's own tx history.
+    pub message: String,
+    pub blocks: u32,
+}
+
+async fn btc_invoice(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<BtcInvoiceReq>,
+) -> Result<Json<BtcInvoiceResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    if req.blocks == 0 {
+        return Err(ApiError::BadRequest(
+            "blocks must be >= 1 (one 24-hour unit)".into(),
+        ));
+    }
+
+    let issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+    let claim = Claim::from_issue_body(&issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    // Total cost = single-block price × number of blocks. checked_mul
+    // so a malicious or misconfigured frontend can't overflow u64
+    // and surprise the wallet.
+    let amount_sats = claim
+        .btc
+        .price_per_24h_sats
+        .checked_mul(req.blocks as u64)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "blocks={} × price_per_24h_sats={} overflows u64",
+                req.blocks, claim.btc.price_per_24h_sats
+            ))
+        })?;
+    let amount_btc = format_btc(amount_sats);
+
+    // BIP21: bitcoin:<address>?amount=<BTC>&label=...&message=...
+    // Each query value is percent-encoded per RFC 3986. We don't
+    // pull `url::Url` for one URI — the value space is small and
+    // we know the inputs.
+    let label = "Sats for Compute";
+    let message = claim.claim_id.clone();
+    let bip21_uri = format!(
+        "bitcoin:{address}?amount={amount}&label={label}&message={message}",
+        address = claim.btc.address,
+        amount = amount_btc,
+        label = percent_encode(label),
+        message = percent_encode(&message),
+    );
+
+    Ok(Json(BtcInvoiceResp {
+        address: claim.btc.address,
+        amount_sats,
+        amount_btc,
+        bip21_uri,
+        message,
+        blocks: req.blocks,
+    }))
+}
+
+/// Sats → BTC as a fixed 8-decimal string. `50_000` sats → `"0.00050000"`.
+/// Stable width is friendlier to copy-paste and to humans reading
+/// the URI; wallets accept any number of decimals.
+fn format_btc(sats: u64) -> String {
+    let whole = sats / 100_000_000;
+    let frac = sats % 100_000_000;
+    format!("{whole}.{frac:08}")
+}
+
+/// Percent-encode a value for BIP21 query parameters. Conservative
+/// allowed-set: ALPHA / DIGIT / `-_.~` (RFC 3986 unreserved). Spaces
+/// in `label` become `%20`, claim_ids that contain `_` survive
+/// untouched.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            for b in c.to_string().as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 // ── auth + error mapping ─────────────────────────────────────────
 
 fn require_tool_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
@@ -546,6 +668,31 @@ mod tests {
             label_state_slug("active_pending_confirmation"),
             "active-pending-confirmation"
         );
+    }
+
+    #[test]
+    fn format_btc_pads_to_eight_decimals() {
+        assert_eq!(format_btc(0), "0.00000000");
+        assert_eq!(format_btc(1), "0.00000001");
+        assert_eq!(format_btc(50_000), "0.00050000");
+        assert_eq!(format_btc(100_000_000), "1.00000000");
+        assert_eq!(format_btc(150_000_000), "1.50000000");
+        assert_eq!(format_btc(2_100_000_000_000_000), "21000000.00000000");
+    }
+
+    #[test]
+    fn percent_encode_passes_unreserved_through() {
+        assert_eq!(percent_encode("claim_abc-123.0"), "claim_abc-123.0");
+        assert_eq!(percent_encode("Sats for Compute"), "Sats%20for%20Compute");
+        // Multi-byte UTF-8 (just to make sure we don't panic / mangle).
+        assert_eq!(percent_encode("café"), "caf%C3%A9");
+    }
+
+    #[test]
+    fn percent_encode_handles_bip21_special_chars() {
+        // Anything that would break the URI must be encoded.
+        assert_eq!(percent_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(percent_encode("a?b#c"), "a%3Fb%23c");
     }
 
     #[test]
