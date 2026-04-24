@@ -1,0 +1,92 @@
+name: Release
+
+# Build a static (musl) `satsforcompute` binary and publish it as a
+# GitHub release asset. Two flavors:
+#
+#   push to main      → rolling `latest` tag (recreated each run)
+#   push tag v*       → immutable v* release
+#   workflow_dispatch → rolling `latest` tag (manual rebuild)
+#
+# The operator workload's EE manifest references the binary via
+# `github_release: { repo: satsforcompute/satsforcompute, asset:
+# satsforcompute, tag: latest|v0.x.y }`. EE fetches the asset over
+# HTTPS at boot, no build step inside the enclave.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - "README.md"
+      - "CLAUDE.md"
+  workflow_dispatch:
+
+# Tag pushes and main pushes shouldn't cancel each other; serialize
+# instead. PR runs (handled by ci.yml) cancel-in-progress; this
+# workflow doesn't run on PRs at all.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # Sigstore-backed build provenance attestation, same pattern dd
+  # uses. Lets a verifier confirm a binary was produced by THIS
+  # workflow on THIS commit, not hand-uploaded.
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release, static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PRERELEASE=""
+          else
+            TAG="latest"
+            PRERELEASE=""
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/x86_64-unknown-linux-musl/release/satsforcompute
+          subject-name: satsforcompute
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/satsforcompute
+          # Rolling tag (`latest`) gets recreated each run. Versioned
+          # v* tags are immutable — fail loudly if someone tries to
+          # rebuild over one.
+          if [[ "$TAG" == "latest" ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          fi
+          gh release create "$TAG" $PRERELEASE \
+            --title "$TAG" \
+            --notes "Built from ${GITHUB_SHA}" \
+            "$BIN"
