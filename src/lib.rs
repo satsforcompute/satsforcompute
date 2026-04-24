@@ -15,4 +15,5 @@
 
 pub mod claim;
 pub mod config;
+pub mod github;
 pub mod server;
