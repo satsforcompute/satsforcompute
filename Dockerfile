@@ -1,12 +1,15 @@
-FROM rust:1.86-slim AS builder
-WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN cargo build --release
+# Build a static (musl) `satsforcompute` binary in a builder stage,
+# then copy it into a minimal scratch image. Same pattern as
+# devopsdefender/dd's release.yml so the operator workload can ride
+# the same EE github_release fetch path.
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates openssh-client \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/dd-market /usr/local/bin/dd-market
-ENTRYPOINT ["dd-market"]
+FROM rust:1.86-alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --target x86_64-unknown-linux-musl
+
+FROM scratch
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/satsforcompute /satsforcompute
+ENTRYPOINT ["/satsforcompute"]
