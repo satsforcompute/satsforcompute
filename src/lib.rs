@@ -13,6 +13,7 @@
 //! v0 scope: scaffold + `Claim` manifest schema (`s12e.claim.v1`).
 //! Real handlers are stubs; `/healthz` is the only live route.
 
+pub mod btc;
 pub mod claim;
 pub mod config;
 pub mod github;
