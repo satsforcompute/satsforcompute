@@ -38,6 +38,12 @@ pub struct Config {
     /// 3 hours (vs the original 1h, which fee-market congestion
     /// false-terminates).
     pub pending_timeout_secs: u64,
+    /// GitHub bearer token. Either a fine-grained PAT (quickstart) or
+    /// a GitHub App installation token (production). Provides
+    /// read+write on the configured `state_repo`'s issues, comments,
+    /// and labels — see `github.rs` for the exact REST surface used.
+    /// Held only in process memory; never logged.
+    pub github_token: String,
 }
 
 impl Config {
@@ -51,6 +57,7 @@ impl Config {
         let sweep_address = require_env("SATS_SWEEP_ADDRESS")?;
         let price_per_24h_sats = parse_env("SATS_PRICE_PER_24H_SATS", "50000")?;
         let pending_timeout_secs = parse_env("SATS_PENDING_TIMEOUT_SECS", "10800")?;
+        let github_token = require_env("SATS_GITHUB_TOKEN")?;
 
         if !state_repo.contains('/') {
             bail!("SATS_STATE_REPO must be 'owner/repo', got {state_repo:?}");
@@ -67,6 +74,7 @@ impl Config {
             sweep_address,
             price_per_24h_sats,
             pending_timeout_secs,
+            github_token,
         })
     }
 }

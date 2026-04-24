@@ -10,6 +10,7 @@ This repo is a full rewrite of the previous BTCPay+SQLite+SSH iteration. The spe
 - **State backend = GitHub issues.** One claim per issue. The body is the canonical JSON manifest; comments are append-only event history. No local DB.
 - **Privileged DD actions = `workflow_dispatch`.** The bot triggers an operator-ops workflow that mints GitHub Actions OIDC and calls `POST /owner` / `/deploy` on dd-agents. The bot itself never holds DD write credentials.
 - **Wallet = BDK in a separate EE workload.** Ephemeral hot seed, sweeps to operator cold storage on every 1-conf payment. Operator restart is an accepted funds-loss event for in-flight invoices.
+  - **Dev/testing path:** when iterating, point the bot at a wallet whose seed the operator has a backup of (xpub-derived BIP32 chain) instead of the enclave's ephemeral seed. Avoids losing test sats every time the dev env restarts. Production path stays enclave-ephemeral. To be wired by the wallet-workload PR via a `SATS_WALLET_MODE=dev|enclave` switch (or similar).
 - **BTC watcher = pluggable (mempool.space adapter for v0).** Polled.
 
 ## Key types

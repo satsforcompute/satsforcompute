@@ -105,6 +105,7 @@ mod tests {
             sweep_address: "bc1q-test".into(),
             price_per_24h_sats: 50_000,
             pending_timeout_secs: 10_800,
+            github_token: "test-token".into(),
         }
     }
 
