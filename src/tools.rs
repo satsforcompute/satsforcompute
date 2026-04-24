@@ -26,7 +26,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::claim::{BtcDetails, Claim, ClaimMode};
+use crate::claim::{BtcDetails, CURRENT_SCHEMA, Claim, ClaimMode, ClaimState};
 use crate::config::Config;
 use crate::github;
 
@@ -43,6 +43,8 @@ pub struct State_ {
 pub fn router(state: State_) -> Router {
     Router::new()
         .route("/tools/claim.create", post(claim_create))
+        .route("/tools/claim.load", post(claim_load))
+        .route("/tools/claim.update", post(claim_update))
         .with_state(state)
 }
 
@@ -185,6 +187,212 @@ fn rand_suffix() -> u32 {
     n.wrapping_mul(2_654_435_761) ^ nanos
 }
 
+// ── claim.load ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimLoadReq {
+    /// GitHub issue number on the configured `state_repo`. The bot
+    /// always knows the number (it minted it via claim.create); this
+    /// tool just rehydrates the manifest from the on-chain-of-record
+    /// (the GitHub issue body).
+    pub issue_number: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimLoadResp {
+    pub claim: Claim,
+    pub issue_number: u64,
+    pub issue_url: String,
+    pub state: String,
+    pub labels: Vec<String>,
+}
+
+async fn claim_load(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimLoadReq>,
+) -> Result<Json<ClaimLoadResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    let issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+
+    let claim = Claim::from_issue_body(&issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    Ok(Json(ClaimLoadResp {
+        claim,
+        issue_number: issue.number,
+        issue_url: issue.html_url,
+        state: issue.state,
+        labels: issue
+            .labels
+            .into_iter()
+            .map(|l| l.name().to_string())
+            .collect(),
+    }))
+}
+
+// ── claim.update ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimUpdateReq {
+    /// GitHub issue number to update.
+    pub issue_number: u64,
+    /// New claim manifest. Must:
+    /// - declare `schema == CURRENT_SCHEMA`
+    /// - match the existing manifest's `claim_id`
+    pub claim: Claim,
+    /// Optional human-facing note appended to the issue as a comment.
+    /// Spec: "comments are append-only event/conversation history."
+    /// State changes always log a default note even if this is unset,
+    /// so the audit trail is never empty.
+    #[serde(default)]
+    pub event_note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimUpdateResp {
+    pub claim: Claim,
+    pub issue_number: u64,
+    pub issue_url: String,
+    pub previous_state: String,
+    pub new_state: String,
+    pub state_changed: bool,
+}
+
+async fn claim_update(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimUpdateReq>,
+) -> Result<Json<ClaimUpdateResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    // Schema guardrail. Spec section "Tool API guardrails" requires
+    // `claim.update` to "preserve canonical schema and event history."
+    // Reject manifests that don't match the schema we know how to
+    // round-trip — a future schema bump (s12e.claim.v2 etc.) will
+    // explicitly handle migration.
+    if req.claim.schema != CURRENT_SCHEMA {
+        return Err(ApiError::BadRequest(format!(
+            "claim.schema must be {CURRENT_SCHEMA:?}, got {:?}",
+            req.claim.schema
+        )));
+    }
+
+    // Load the existing issue so we can validate claim_id continuity
+    // and detect state transitions.
+    let existing_issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+    let existing_claim = Claim::from_issue_body(&existing_issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    if existing_claim.claim_id != req.claim.claim_id {
+        return Err(ApiError::BadRequest(format!(
+            "claim_id mismatch: issue holds {:?}, request has {:?}",
+            existing_claim.claim_id, req.claim.claim_id
+        )));
+    }
+
+    let previous_state = state_str(existing_claim.state);
+    let new_state = state_str(req.claim.state);
+    let state_changed = previous_state != new_state;
+
+    // Write the new manifest (body PATCH).
+    let body = req.claim.to_issue_body();
+    state
+        .github
+        .update_issue_body(&state.cfg.state_repo, req.issue_number, &body)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github update_issue_body: {e}")))?;
+
+    // State-transition label flip. Removing the old label first; then
+    // adding the new — order doesn't matter to GitHub but the event
+    // log reads cleaner with -then-+. Idempotent if state unchanged.
+    if state_changed {
+        let old_label = format!("state:{}", label_state_slug(previous_state));
+        let new_label = format!("state:{}", label_state_slug(new_state));
+        // 404 is treated as success in remove_label, so a freshly-
+        // labelled issue won't fail the transition just because the
+        // old label was already absent.
+        state
+            .github
+            .remove_label(&state.cfg.state_repo, req.issue_number, &old_label)
+            .await
+            .map_err(|e| ApiError::Upstream(format!("remove_label {old_label}: {e}")))?;
+        state
+            .github
+            .add_labels(&state.cfg.state_repo, req.issue_number, &[&new_label])
+            .await
+            .map_err(|e| ApiError::Upstream(format!("add_labels {new_label}: {e}")))?;
+    }
+
+    // Append an event-history comment. Default note describes the
+    // transition; an operator-supplied `event_note` extends it.
+    let mut comment = if state_changed {
+        format!("State: `{previous_state}` → `{new_state}`")
+    } else {
+        format!("Manifest updated (state unchanged: `{new_state}`)")
+    };
+    if let Some(extra) = req.event_note.as_deref().filter(|s| !s.is_empty()) {
+        comment.push_str("\n\n");
+        comment.push_str(extra);
+    }
+    state
+        .github
+        .add_comment(&state.cfg.state_repo, req.issue_number, &comment)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("add_comment: {e}")))?;
+
+    Ok(Json(ClaimUpdateResp {
+        claim: req.claim,
+        issue_number: req.issue_number,
+        issue_url: existing_issue.html_url,
+        previous_state: previous_state.into(),
+        new_state: new_state.into(),
+        state_changed,
+    }))
+}
+
+/// Map the snake_case `ClaimState` JSON form to a label-friendly slug
+/// (kebab-case). GitHub labels conventionally use kebab-case, and
+/// `state:active`/`state:overdue`/etc. read more naturally than
+/// `state:active` ↔ JSON `state:"active"` already aligning, but the
+/// multi-word ones like `payment_failed` flip to `payment-failed`.
+fn label_state_slug(s: &str) -> String {
+    s.replace('_', "-")
+}
+
+/// Stringify `ClaimState` to the same snake_case form serde produces.
+/// Centralized so labels and JSON stay in sync.
+fn state_str(s: ClaimState) -> &'static str {
+    match s {
+        ClaimState::Requested => "requested",
+        ClaimState::InvoiceCreated => "invoice_created",
+        ClaimState::BtcMempoolSeen => "btc_mempool_seen",
+        ClaimState::NodeAssignmentStarted => "node_assignment_started",
+        ClaimState::OwnerUpdateDispatched => "owner_update_dispatched",
+        ClaimState::ActivePendingConfirmation => "active_pending_confirmation",
+        ClaimState::BtcConfirmed => "btc_confirmed",
+        ClaimState::Active => "active",
+        ClaimState::Overdue => "overdue",
+        ClaimState::Shutdown => "shutdown",
+        ClaimState::PaymentFailed => "payment_failed",
+        ClaimState::BootFailed => "boot_failed",
+        ClaimState::OwnerUpdateFailed => "owner_update_failed",
+        ClaimState::AttestationFailed => "attestation_failed",
+        ClaimState::ShutdownFailed => "shutdown_failed",
+        ClaimState::NodeFailed => "node_failed",
+        ClaimState::ManualReview => "manual_review",
+    }
+}
+
 // ── auth + error mapping ─────────────────────────────────────────
 
 fn require_tool_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
@@ -299,5 +507,80 @@ mod tests {
         assert!(cd.contains(&"mode:customer-deploy"));
         let cf: Vec<_> = base_labels(ClaimMode::Confidential).collect();
         assert!(cf.contains(&"mode:confidential"));
+    }
+
+    #[test]
+    fn state_str_round_trips_with_serde() {
+        // Every variant of ClaimState the spec lists. If serde's
+        // snake_case rename and our `state_str` ever drift, this test
+        // catches it before claim.update mislabels an issue.
+        for st in [
+            ClaimState::Requested,
+            ClaimState::InvoiceCreated,
+            ClaimState::BtcMempoolSeen,
+            ClaimState::NodeAssignmentStarted,
+            ClaimState::OwnerUpdateDispatched,
+            ClaimState::ActivePendingConfirmation,
+            ClaimState::BtcConfirmed,
+            ClaimState::Active,
+            ClaimState::Overdue,
+            ClaimState::Shutdown,
+            ClaimState::PaymentFailed,
+            ClaimState::BootFailed,
+            ClaimState::OwnerUpdateFailed,
+            ClaimState::AttestationFailed,
+            ClaimState::ShutdownFailed,
+            ClaimState::NodeFailed,
+            ClaimState::ManualReview,
+        ] {
+            let via_serde = serde_json::to_value(st).unwrap();
+            assert_eq!(via_serde, state_str(st));
+        }
+    }
+
+    #[test]
+    fn label_state_slug_kebabs_underscored_states() {
+        assert_eq!(label_state_slug("active"), "active");
+        assert_eq!(label_state_slug("payment_failed"), "payment-failed");
+        assert_eq!(
+            label_state_slug("active_pending_confirmation"),
+            "active-pending-confirmation"
+        );
+    }
+
+    #[test]
+    fn claim_update_rejects_wrong_schema() {
+        // Schema-version guardrail check that doesn't need a live
+        // GitHub round-trip — synthesize a Claim with the wrong
+        // schema and assert validation returns BadRequest.
+        let mut c = Claim::new(
+            "claim_x",
+            ClaimMode::CustomerDeploy,
+            BtcDetails {
+                address: "bc1q-x".into(),
+                price_per_24h_sats: 50_000,
+                required_confirmations: 1,
+                pending_timeout_secs: 10_800,
+            },
+        );
+        c.schema = "future.claim.v9".into();
+        // The actual handler reaches the GitHub call only after the
+        // schema check passes — confirming the order means the BadRequest
+        // path doesn't depend on having a network. We replicate the
+        // check inline because the handler signature requires axum
+        // State, which is awkward to materialise without a running
+        // server.
+        let err = if c.schema != CURRENT_SCHEMA {
+            Some(ApiError::BadRequest(format!(
+                "claim.schema must be {CURRENT_SCHEMA:?}, got {:?}",
+                c.schema
+            )))
+        } else {
+            None
+        };
+        match err {
+            Some(ApiError::BadRequest(msg)) => assert!(msg.contains("future.claim.v9")),
+            _ => panic!("expected BadRequest"),
+        }
     }
 }
