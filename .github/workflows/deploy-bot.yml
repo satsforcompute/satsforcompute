@@ -1,0 +1,112 @@
+name: Deploy bot
+
+# Push the satsforcompute binary onto the dd-local-bot agent on tdx2.
+# Triggers:
+#   - workflow_run after Release succeeds on main → automatic redeploy
+#     when a new `latest` is published.
+#   - workflow_dispatch → manual redeploy without a code change.
+#
+# Assumes:
+#   - dd-local-bot is already provisioned + running on tdx2 (one-time
+#     `apps/_infra/local-agents.sh "" "" https://app.devopsdefender.com`
+#     in the dd repo, then `virsh start dd-local-bot`).
+#   - The agent has been one-time-set with `agent_owner = satsforcompute`
+#     via a fleet-OIDC POST to `/owner` so this workflow's OIDC
+#     (`repository_owner = satsforcompute`) is accepted by /deploy.
+#   - Required secrets are set on this repo: SATS_STATE_REPO,
+#     SATS_SWEEP_ADDRESS, SATS_GITHUB_TOKEN, SATS_TOOL_API_TOKEN.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for the OIDC token dd-deploy mints
+
+# Serialize: a manual dispatch racing the workflow_run from a fresh
+# release shouldn't both deploy.
+concurrency:
+  group: deploy-bot
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (this repo, for the workload template)
+        uses: actions/checkout@v4
+
+      - name: Checkout dd (for the dd-deploy composite action)
+        uses: actions/checkout@v4
+        with:
+          repository: devopsdefender/dd
+          ref: main
+          path: dd
+
+      - name: Bake workload manifest
+        env:
+          SATS_STATE_REPO:    ${{ secrets.SATS_STATE_REPO }}
+          SATS_SWEEP_ADDRESS: ${{ secrets.SATS_SWEEP_ADDRESS }}
+          SATS_GITHUB_TOKEN:  ${{ secrets.SATS_GITHUB_TOKEN }}
+          SATS_TOOL_API_TOKEN: ${{ secrets.SATS_TOOL_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same `bake` idiom dd uses in its own boot-time workload
+          # rendering: extract only the ${VAR} refs that actually
+          # appear in the template, run envsubst restricted to them
+          # (so any future $shell_var inside cmd strings stays intact),
+          # then jq-strip empty `KEY=` env entries (cheap defense
+          # against an unset secret turning into an empty-string env
+          # var the binary would interpret as "configured").
+          vars=$(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' apps/workload.json.tmpl | sort -u | tr -d '\n')
+          envsubst "$vars" < apps/workload.json.tmpl \
+            | jq -c 'if .env then .env |= map(select(test("^[^=]+=.+"))) else . end' \
+            > /tmp/workload.json
+          jq -e '.app_name == "satsforcompute"' /tmp/workload.json > /dev/null
+
+      - name: Deploy via dd-deploy
+        uses: ./dd/.github/actions/dd-deploy
+        with:
+          cp-url: https://app.devopsdefender.com
+          vm-name: dd-local-bot
+          workload: /tmp/workload.json
+          wait-for-deployment-seconds: '180'
+
+      - name: Verify /healthz
+        run: |
+          set -euo pipefail
+          # The dd-deploy step waits for the workload to appear in
+          # /health.deployments, but doesn't validate the bot's own
+          # /healthz response. Confirm the bot is actually serving on
+          # `bot-<agent>.devopsdefender.com` before declaring success.
+          # We discover the bot's hostname through the CP's /api/agents
+          # listing — same path dd-deploy used.
+          AGENT_HOST=$(curl -fsSL \
+            -H "Authorization: Bearer $(curl -fsSL \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=dd-agent" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              | jq -r .value)" \
+            "https://app.devopsdefender.com/api/agents" \
+            | jq -r '[.[] | select(.vm_name=="dd-local-bot" and .status=="healthy")][0].hostname')
+          if [ -z "$AGENT_HOST" ] || [ "$AGENT_HOST" = "null" ]; then
+            echo "::error::no healthy dd-local-bot agent in /api/agents"
+            exit 1
+          fi
+          # `bot-<base>.<rest>` per dd's label_hostname flatten rule.
+          BOT_HOST=$(echo "$AGENT_HOST" | sed -E 's/^([^.]+)\.(.*)$/\1-bot.\2/')
+          echo "verifying https://${BOT_HOST}/healthz"
+          for i in $(seq 1 24); do
+            if curl -fsSL "https://${BOT_HOST}/healthz" | jq -e '.ok == true' > /dev/null; then
+              echo "ok"
+              exit 0
+            fi
+            echo "  not yet ready ($i/24)"
+            sleep 5
+          done
+          echo "::error::/healthz never returned ok=true"
+          exit 1
