@@ -1,0 +1,38 @@
+{
+  "name": "@satsforcompute/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Sats for Compute marketplace bot. Exposes the bot's /tools/* API as MCP tools so any MCP host (Claude Code, Cursor, claude.ai) can drive the v0 product flow in natural language.",
+  "license": "MIT",
+  "homepage": "https://satsforcompute.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/satsforcompute/satsforcompute.git",
+    "directory": "mcp"
+  },
+  "type": "module",
+  "bin": {
+    "satsforcompute-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
