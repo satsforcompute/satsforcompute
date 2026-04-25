@@ -14,7 +14,8 @@ name: Deploy bot
 #     via a fleet-OIDC POST to `/owner` so this workflow's OIDC
 #     (`repository_owner = satsforcompute`) is accepted by /deploy.
 #   - Required secrets are set on this repo: SATS_STATE_REPO,
-#     SATS_SWEEP_ADDRESS, SATS_GITHUB_TOKEN, SATS_TOOL_API_TOKEN.
+#     SATS_SWEEP_ADDRESS, SATS_GITHUB_TOKEN, SATS_TOOL_API_TOKEN,
+#     SATS_OPS_REPO.
 
 on:
   workflow_run:
@@ -54,6 +55,7 @@ jobs:
           SATS_SWEEP_ADDRESS: ${{ secrets.SATS_SWEEP_ADDRESS }}
           SATS_GITHUB_TOKEN:  ${{ secrets.SATS_GITHUB_TOKEN }}
           SATS_TOOL_API_TOKEN: ${{ secrets.SATS_TOOL_API_TOKEN }}
+          SATS_OPS_REPO:      ${{ secrets.SATS_OPS_REPO }}
         run: |
           set -euo pipefail
           # Same `bake` idiom dd uses in its own boot-time workload

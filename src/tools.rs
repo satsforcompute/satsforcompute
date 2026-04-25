@@ -46,6 +46,11 @@ pub fn router(state: State_) -> Router {
         .route("/tools/claim.load", post(claim_load))
         .route("/tools/claim.update", post(claim_update))
         .route("/tools/btc.invoice", post(btc_invoice))
+        .route("/tools/node.boot", post(node_boot))
+        .route(
+            "/tools/dd.dispatch_owner_update",
+            post(dd_dispatch_owner_update),
+        )
         .with_state(state)
 }
 
@@ -122,14 +127,23 @@ async fn claim_create(
         pending_timeout_secs: state.cfg.pending_timeout_secs,
     };
     let mut claim = Claim::new(&claim_id, req.mode, btc);
-    claim.customer_owner = match req.mode {
-        ClaimMode::CustomerDeploy => req.customer_owner,
-        // Confidential mode: don't bind a customer org. The workload
-        // repo + ref end up in the claim manifest via a future field;
-        // for v0 we just discard them — the issue summary will note
-        // the workload source via the human-facing comment instead.
-        ClaimMode::Confidential => None,
-    };
+    match req.mode {
+        ClaimMode::CustomerDeploy => {
+            claim.customer_owner = req.customer_owner;
+        }
+        ClaimMode::Confidential => {
+            // Don't bind a customer org — the bot owns the node and
+            // deploys a sealed workload. Persist the workload source
+            // onto the claim so node.boot (and the orchestrator) can
+            // build dispatch inputs from issue_number alone.
+            claim.workload_repo = req.workload_repo;
+            claim.workload_ref = Some(
+                req.workload_ref
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "main".into()),
+            );
+        }
+    }
 
     let title = format!("claim {}", claim_id);
     let body = claim.to_issue_body();
@@ -515,6 +529,252 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+// ── node.boot ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct NodeBootReq {
+    pub issue_number: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeBootResp {
+    pub claim_id: String,
+    pub dispatch: WorkflowDispatch,
+}
+
+/// Echo of the dispatch the bot fired. The workflow API returns 204 No
+/// Content with no run ID, so we surface back what we sent — operator
+/// frontends use this to find the matching run via
+/// `/repos/{ops_repo}/actions/workflows/{file}/runs?head_sha=...`
+/// or by filtering on the claim_id input.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDispatch {
+    pub ops_repo: String,
+    pub workflow: String,
+    #[serde(rename = "ref")]
+    pub ref_: String,
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+}
+
+async fn node_boot(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<NodeBootReq>,
+) -> Result<Json<NodeBootResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    let issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+    let claim = Claim::from_issue_body(&issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    let inputs = build_boot_inputs(&claim)?;
+    let workflow = state.cfg.ops_boot_workflow.clone();
+    let ref_ = state.cfg.ops_ref.clone();
+    let ops_repo = state.cfg.ops_repo.clone();
+
+    state
+        .github
+        .dispatch_workflow(&ops_repo, &workflow, &ref_, &inputs)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("dispatch_workflow boot: {e}")))?;
+
+    Ok(Json(NodeBootResp {
+        claim_id: claim.claim_id,
+        dispatch: WorkflowDispatch {
+            ops_repo,
+            workflow,
+            ref_,
+            inputs,
+        },
+    }))
+}
+
+/// Build the `inputs` map for the `boot-agent.yml` workflow_dispatch.
+/// Pure helper so the wire shape can be doc-tested without spinning up
+/// a real GitHub round-trip.
+///
+/// Customer-deploy mode populates `customer_owner` and leaves the
+/// workload fields empty. Confidential mode populates `workload_repo`
+/// and `workload_ref` and leaves `customer_owner` empty. The receiving
+/// workflow branches on `mode`.
+///
+/// ```
+/// use satsforcompute::claim::{BtcDetails, Claim, ClaimMode};
+/// use satsforcompute::tools::build_boot_inputs;
+///
+/// let mut c = Claim::new(
+///     "claim_42",
+///     ClaimMode::CustomerDeploy,
+///     BtcDetails {
+///         address: "bc1q-x".into(),
+///         price_per_24h_sats: 50_000,
+///         required_confirmations: 1,
+///         pending_timeout_secs: 10_800,
+///     },
+/// );
+/// c.customer_owner = Some("alice".into());
+/// let inputs = build_boot_inputs(&c).unwrap();
+/// assert_eq!(inputs["claim_id"], "claim_42");
+/// assert_eq!(inputs["mode"], "customer_deploy");
+/// assert_eq!(inputs["customer_owner"], "alice");
+/// assert_eq!(inputs["workload_repo"], "");
+/// ```
+pub fn build_boot_inputs(
+    claim: &Claim,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let mut inputs = serde_json::Map::new();
+    inputs.insert("claim_id".into(), claim.claim_id.clone().into());
+    inputs.insert(
+        "mode".into(),
+        match claim.mode {
+            ClaimMode::CustomerDeploy => "customer_deploy",
+            ClaimMode::Confidential => "confidential",
+        }
+        .into(),
+    );
+    inputs.insert(
+        "customer_owner".into(),
+        claim.customer_owner.clone().unwrap_or_default().into(),
+    );
+    match claim.mode {
+        ClaimMode::CustomerDeploy => {
+            inputs.insert("workload_repo".into(), "".into());
+            inputs.insert("workload_ref".into(), "".into());
+        }
+        ClaimMode::Confidential => {
+            let repo = claim.workload_repo.as_deref().unwrap_or("");
+            if repo.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "confidential claim missing workload_repo on manifest".into(),
+                ));
+            }
+            inputs.insert("workload_repo".into(), repo.into());
+            inputs.insert(
+                "workload_ref".into(),
+                claim
+                    .workload_ref
+                    .clone()
+                    .unwrap_or_else(|| "main".into())
+                    .into(),
+            );
+        }
+    }
+    Ok(inputs)
+}
+
+// ── dd.dispatch_owner_update ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct DdDispatchOwnerUpdateReq {
+    pub issue_number: u64,
+    /// Public hostname of the dd-agent the owner-update should land on,
+    /// e.g. `dd-agent-7.devopsdefender.com`. The orchestrator passes
+    /// the value the boot workflow wrote back into
+    /// `claim.agent_hostname`; manual operators can override it.
+    #[serde(default)]
+    pub agent_host: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DdDispatchOwnerUpdateResp {
+    pub claim_id: String,
+    pub dispatch: WorkflowDispatch,
+}
+
+async fn dd_dispatch_owner_update(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<DdDispatchOwnerUpdateReq>,
+) -> Result<Json<DdDispatchOwnerUpdateResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    let issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+    let claim = Claim::from_issue_body(&issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    // Fail-closed: confidential mode has no /owner route on the agent
+    // (it's not registered when DD_CONFIDENTIAL=true). Calling owner-
+    // update there would be a no-op at best, a misleading audit-trail
+    // entry at worst.
+    if matches!(claim.mode, ClaimMode::Confidential) {
+        return Err(ApiError::BadRequest(
+            "dd.dispatch_owner_update is not valid for confidential claims".into(),
+        ));
+    }
+
+    // Caller may override; otherwise read from the manifest the boot
+    // workflow wrote back.
+    let agent_host = req
+        .agent_host
+        .filter(|s| !s.is_empty())
+        .or_else(|| claim.agent_hostname.clone())
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "agent_host required (none on request and none on claim manifest)".into(),
+            )
+        })?;
+    let agent_owner = claim.customer_owner.clone().ok_or_else(|| {
+        ApiError::BadRequest(
+            "claim.customer_owner is unset; can't dispatch owner-update without an owner".into(),
+        )
+    })?;
+
+    let inputs = build_owner_update_inputs(&claim.claim_id, &agent_host, &agent_owner);
+    let workflow = state.cfg.ops_owner_workflow.clone();
+    let ref_ = state.cfg.ops_ref.clone();
+    let ops_repo = state.cfg.ops_repo.clone();
+
+    state
+        .github
+        .dispatch_workflow(&ops_repo, &workflow, &ref_, &inputs)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("dispatch_workflow owner-update: {e}")))?;
+
+    Ok(Json(DdDispatchOwnerUpdateResp {
+        claim_id: claim.claim_id,
+        dispatch: WorkflowDispatch {
+            ops_repo,
+            workflow,
+            ref_,
+            inputs,
+        },
+    }))
+}
+
+/// Build the `inputs` map for the `owner-update.yml` workflow.
+///
+/// ```
+/// use satsforcompute::tools::build_owner_update_inputs;
+///
+/// let inputs = build_owner_update_inputs(
+///     "claim_42",
+///     "dd-agent-7.devopsdefender.com",
+///     "alice",
+/// );
+/// assert_eq!(inputs["claim_id"], "claim_42");
+/// assert_eq!(inputs["agent_host"], "dd-agent-7.devopsdefender.com");
+/// assert_eq!(inputs["agent_owner"], "alice");
+/// ```
+pub fn build_owner_update_inputs(
+    claim_id: &str,
+    agent_host: &str,
+    agent_owner: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut inputs = serde_json::Map::new();
+    inputs.insert("claim_id".into(), claim_id.into());
+    inputs.insert("agent_host".into(), agent_host.into());
+    inputs.insert("agent_owner".into(), agent_owner.into());
+    inputs
+}
+
 // ── auth + error mapping ─────────────────────────────────────────
 
 fn require_tool_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
@@ -693,6 +953,48 @@ mod tests {
         // Anything that would break the URI must be encoded.
         assert_eq!(percent_encode("a&b=c"), "a%26b%3Dc");
         assert_eq!(percent_encode("a?b#c"), "a%3Fb%23c");
+    }
+
+    #[test]
+    fn build_boot_inputs_confidential_requires_workload_repo() {
+        // A confidential claim missing workload_repo on the manifest is
+        // a programming error upstream — fail-closed at dispatch time.
+        let c = Claim::new(
+            "claim_x",
+            ClaimMode::Confidential,
+            BtcDetails {
+                address: "bc1q-x".into(),
+                price_per_24h_sats: 50_000,
+                required_confirmations: 1,
+                pending_timeout_secs: 10_800,
+            },
+        );
+        match build_boot_inputs(&c) {
+            Err(ApiError::BadRequest(m)) => assert!(m.contains("workload_repo")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_boot_inputs_confidential_carries_workload_ref() {
+        let mut c = Claim::new(
+            "claim_x",
+            ClaimMode::Confidential,
+            BtcDetails {
+                address: "bc1q-x".into(),
+                price_per_24h_sats: 50_000,
+                required_confirmations: 1,
+                pending_timeout_secs: 10_800,
+            },
+        );
+        c.workload_repo = Some("alice/oracle".into());
+        c.workload_ref = Some("v1.2.3".into());
+        let inputs = build_boot_inputs(&c).unwrap();
+        assert_eq!(inputs["mode"], "confidential");
+        assert_eq!(inputs["workload_repo"], "alice/oracle");
+        assert_eq!(inputs["workload_ref"], "v1.2.3");
+        // No customer_owner binding in confidential mode.
+        assert_eq!(inputs["customer_owner"], "");
     }
 
     #[test]

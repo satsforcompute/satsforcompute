@@ -50,6 +50,20 @@ pub struct Config {
     /// for v0; multi-tenant tool-API auth (per-frontend tokens) is a
     /// future cleanup.
     pub tool_api_token: String,
+    /// `owner/repo` of the operator-ops repo holding privileged
+    /// workflows the bot dispatches via `workflow_dispatch`. The
+    /// ops repo is what actually does cloud provisioning + DD
+    /// `/owner` calls; the bot itself never holds those creds.
+    /// See `OPS_REPO.md` for the workflow contract.
+    pub ops_repo: String,
+    /// Filename of the boot-agent workflow inside `ops_repo`.
+    /// Defaults to `boot-agent.yml`.
+    pub ops_boot_workflow: String,
+    /// Filename of the owner-update workflow inside `ops_repo`.
+    /// Defaults to `owner-update.yml`.
+    pub ops_owner_workflow: String,
+    /// Git ref the dispatched workflows run from. Default `main`.
+    pub ops_ref: String,
 }
 
 impl Config {
@@ -65,9 +79,18 @@ impl Config {
         let pending_timeout_secs = parse_env("SATS_PENDING_TIMEOUT_SECS", "10800")?;
         let github_token = require_env("SATS_GITHUB_TOKEN")?;
         let tool_api_token = require_env("SATS_TOOL_API_TOKEN")?;
+        let ops_repo = require_env("SATS_OPS_REPO")?;
+        let ops_boot_workflow =
+            std::env::var("SATS_OPS_BOOT_WORKFLOW").unwrap_or_else(|_| "boot-agent.yml".into());
+        let ops_owner_workflow =
+            std::env::var("SATS_OPS_OWNER_WORKFLOW").unwrap_or_else(|_| "owner-update.yml".into());
+        let ops_ref = std::env::var("SATS_OPS_REF").unwrap_or_else(|_| "main".into());
 
         if !state_repo.contains('/') {
             bail!("SATS_STATE_REPO must be 'owner/repo', got {state_repo:?}");
+        }
+        if !ops_repo.contains('/') {
+            bail!("SATS_OPS_REPO must be 'owner/repo', got {ops_repo:?}");
         }
         if sweep_address.is_empty() {
             bail!("SATS_SWEEP_ADDRESS must be set to a BTC address");
@@ -83,6 +106,10 @@ impl Config {
             pending_timeout_secs,
             github_token,
             tool_api_token,
+            ops_repo,
+            ops_boot_workflow,
+            ops_owner_workflow,
+            ops_ref,
         })
     }
 }

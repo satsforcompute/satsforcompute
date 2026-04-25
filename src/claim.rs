@@ -36,6 +36,18 @@ pub struct Claim {
     /// Mode the bot deployed in. Affects how /deploy and /owner work
     /// on the assigned agent — see SATS_FOR_COMPUTE_SPEC.md.
     pub mode: ClaimMode,
+    /// Public GitHub repo (`owner/repo`) holding the customer's
+    /// `workload.json` for confidential mode. The bot fetches it at
+    /// `workload_ref` when the claim activates and the boot workflow
+    /// dispatches. Unset for `customer_deploy` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_repo: Option<String>,
+    /// Git ref inside `workload_repo` to fetch — branch, tag, or commit
+    /// SHA. Defaults to `main` when set; pinned SHAs let a customer
+    /// prove which exact code their TDX quote attests to. Unset for
+    /// `customer_deploy` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_ref: Option<String>,
     pub btc: BtcDetails,
     pub billing: Billing,
     pub integrity: Integrity,
@@ -145,6 +157,8 @@ impl Claim {
             agent_id: None,
             agent_hostname: None,
             mode,
+            workload_repo: None,
+            workload_ref: None,
             btc,
             billing: Billing {
                 paid_until: None,
