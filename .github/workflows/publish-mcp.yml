@@ -1,0 +1,59 @@
+name: Publish MCP
+
+# Publishes @satsforcompute/mcp to npm whenever a GitHub Release is
+# created with a tag of the form `mcp-vX.Y.Z`. The package version in
+# mcp/package.json must match the tag. Build provenance is attested by
+# the npm registry's --provenance flag.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # for npm provenance
+
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'mcp-v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        working-directory: mcp
+        run: npm ci
+
+      - name: Test
+        working-directory: mcp
+        run: npm test
+
+      - name: Build
+        working-directory: mcp
+        run: npm run build
+
+      - name: Verify package.json version matches tag
+        if: github.event_name == 'release'
+        working-directory: mcp
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          # mcp-v0.1.0 → 0.1.0
+          want="${tag#mcp-v}"
+          got=$(node -p "require('./package.json').version")
+          if [ "$got" != "$want" ]; then
+            echo "::error::tag $tag asks for version $want but package.json declares $got"
+            exit 1
+          fi
+
+      - name: Publish
+        working-directory: mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
