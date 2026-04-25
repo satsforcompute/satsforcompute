@@ -17,9 +17,11 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use tracing::info;
 
+use crate::btc::MempoolSpace;
 use crate::claim::CURRENT_SCHEMA;
 use crate::config::Config;
 use crate::github;
+use crate::lifecycle::Lifecycle;
 use crate::tools;
 
 #[derive(Clone)]
@@ -35,6 +37,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     // the full config + the GitHub client. Health/version stay on a
     // smaller AppState so they don't pull in the GitHub client.
     let github = Arc::new(github::Client::new(cfg_arc.github_token.clone()));
+    let btc = Arc::new(MempoolSpace::new());
+
+    // Spawn the lifecycle orchestrator. It runs the BTC-watch +
+    // state-transition loop in the background; the HTTP listener
+    // serves the tool API in the foreground. Both share the same
+    // GitHub client + config Arc.
+    Lifecycle::new(cfg_arc.clone(), github.clone(), btc.clone()).spawn();
+
     let tool_state = tools::State_ {
         cfg: cfg_arc.clone(),
         github,
