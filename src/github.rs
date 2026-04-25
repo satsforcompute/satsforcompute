@@ -95,6 +95,49 @@ impl Client {
         format!("{GITHUB_API}{path}")
     }
 
+    /// `GET /repos/{owner}/{repo}/issues?labels=l1,l2&state=open` —
+    /// list open issues matching ALL the given labels (GitHub `&`s
+    /// the filter). Used by the lifecycle orchestrator to find
+    /// claims in a specific state for the next transition.
+    ///
+    /// Pulls one page (default 30 issues) — sufficient for an
+    /// operator-scale claim volume; pagination is a follow-up if
+    /// the queue ever grows past it.
+    pub async fn list_open_issues_by_labels(
+        &self,
+        repo: &str,
+        labels: &[&str],
+    ) -> Result<Vec<Issue>> {
+        let labels_csv: String = labels.join(",");
+        let url = self.url(&format!(
+            "/repos/{repo}/issues?state=open&per_page=100&labels={labels_csv}"
+        ));
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("GET {url} → {s}: {body}");
+        }
+        // GitHub returns a flat array of issue+PR objects. Filter
+        // out PRs (they show up in /issues unless the search API
+        // is used; PRs have a `pull_request` field). The Issue
+        // deserializer ignores unknown fields by default but we
+        // still skip PRs to keep the orchestrator focused.
+        let raw: Vec<serde_json::Value> = resp.json().await?;
+        let issues: Vec<Issue> = raw
+            .into_iter()
+            .filter(|v| v.get("pull_request").is_none())
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
+        Ok(issues)
+    }
+
     /// `GET /repos/{owner}/{repo}/issues/{number}`. Used by claim
     /// loaders to fetch the canonical manifest body.
     pub async fn get_issue(&self, repo: &str, number: u64) -> Result<Issue> {

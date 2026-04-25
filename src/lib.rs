@@ -17,5 +17,6 @@ pub mod btc;
 pub mod claim;
 pub mod config;
 pub mod github;
+pub mod lifecycle;
 pub mod server;
 pub mod tools;

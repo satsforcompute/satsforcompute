@@ -93,6 +93,12 @@ pub struct Billing {
     /// partial payment under price_per_24h_sats).
     #[serde(default)]
     pub uncredited_sats: u64,
+    /// Most recent BTC tx the lifecycle orchestrator attributed to
+    /// this claim. Recorded so subsequent ticks know which tx to
+    /// poll for confirmations + so the audit trail (issue comments)
+    /// can link back to the on-chain proof. Cleared on top-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_payment_txid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +149,7 @@ impl Claim {
             billing: Billing {
                 paid_until: None,
                 uncredited_sats: 0,
+                last_payment_txid: None,
             },
             integrity: Integrity {
                 confidential_mode: matches!(mode, ClaimMode::Confidential),
