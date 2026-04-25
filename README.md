@@ -37,6 +37,15 @@ cargo run
 
 `/healthz` echoes the static config back so deploy verification can confirm the binary is up with the right secrets baked in.
 
+## Website
+
+The customer-facing landing at <https://satsforcompute.com> is served from the
+[`gh-pages`](https://github.com/satsforcompute/satsforcompute/tree/gh-pages)
+branch. Edit `index.html` / `style.css` there; PRs against `gh-pages` get a
+preview at `satsforcompute.com/pr-preview/<N>/` via `rossjrw/pr-preview-action`.
+Don't bake the marketing site into this Rust crate — it lives on its own
+branch so design changes don't churn the bot's commit history.
+
 ## Forking your own operator
 
 The bot is deliberately operator-local — every forking operator runs their own instance with their own state repo, sweep address, and (optionally) trust policy on the `/owner` callback. Spec section "Forkable example" covers what a fork looks like. v0 is single-canonical at `satsforcompute.com`; multi-operator federation is post-v0.
