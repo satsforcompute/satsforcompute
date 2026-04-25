@@ -35,9 +35,10 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
 
 use crate::btc::MempoolSpace;
-use crate::claim::{Claim, ClaimState};
+use crate::claim::{Claim, ClaimMode, ClaimState};
 use crate::config::Config;
 use crate::github;
+use crate::tools::{build_boot_inputs, build_owner_update_inputs};
 
 /// Default tick cadence. Fast enough that a 1-conf BTC payment
 /// gets credited within a couple of minutes; slow enough that
@@ -91,6 +92,7 @@ impl Lifecycle {
         self.process_invoice_created().await?;
         self.process_btc_mempool_seen().await?;
         self.process_active().await?;
+        self.process_node_assignment_started().await?;
         Ok(())
     }
 
@@ -236,10 +238,17 @@ impl Lifecycle {
                     continue;
                 }
             };
-            let expired = claim
-                .billing
-                .paid_until
-                .is_some_and(|p| now > p + chrono::Duration::seconds(0));
+            // Boot dispatch comes BEFORE expiry. A claim that just hit
+            // `active` from a 1-conf payment shouldn't be overdued before
+            // we've even tried to provision it (matters around clock
+            // skew or a paused orchestrator catching up after restart).
+            if claim.agent_id.is_none() {
+                if let Err(e) = self.dispatch_node_boot(&issue, &mut claim).await {
+                    warn!(issue = issue.number, error = %e, "dispatch_node_boot failed; will retry");
+                }
+                continue;
+            }
+            let expired = claim.billing.paid_until.is_some_and(|p| now > p);
             if !expired {
                 continue;
             }
@@ -253,6 +262,125 @@ impl Lifecycle {
             .await?;
         }
         Ok(())
+    }
+
+    /// Process claims sitting in `node_assignment_started`.
+    ///
+    /// The boot-agent workflow writes `agent_id` + `agent_hostname`
+    /// back via `claim.update` once the dd-agent is reachable. When
+    /// we see those fields populated, we decide the next step:
+    /// - confidential mode → state back to `active` (no owner binding).
+    /// - customer_deploy mode → dispatch owner-update, state to
+    ///   `owner_update_dispatched`. The owner-update workflow writes
+    ///   state back to `active` upon success.
+    async fn process_node_assignment_started(&self) -> Result<()> {
+        let issues = self
+            .github
+            .list_open_issues_by_labels(
+                &self.cfg.state_repo,
+                &["s12e", "state:node-assignment-started"],
+            )
+            .await
+            .context("list node-assignment-started claims")?;
+        if issues.is_empty() {
+            return Ok(());
+        }
+        for issue in issues {
+            let mut claim = match Claim::from_issue_body(&issue.body) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(issue = issue.number, error = %e, "manifest parse failed");
+                    continue;
+                }
+            };
+            // Wait for the boot workflow to populate the agent fields.
+            if claim.agent_hostname.is_none() {
+                debug!(
+                    issue = issue.number,
+                    "node_assignment_started; waiting for boot workflow to write agent_hostname"
+                );
+                continue;
+            }
+            match claim.mode {
+                ClaimMode::Confidential => {
+                    // Sealed workload — no owner binding. Back to
+                    // `active`; the customer-visible state machine
+                    // converges here.
+                    claim.state = ClaimState::Active;
+                    self.transition(
+                        &issue,
+                        &mut claim,
+                        ClaimState::NodeAssignmentStarted,
+                        "Boot workflow reported agent ready; sealed claim is now active.",
+                    )
+                    .await?;
+                }
+                ClaimMode::CustomerDeploy => {
+                    if claim.customer_owner.as_deref().unwrap_or("").is_empty() {
+                        warn!(
+                            issue = issue.number,
+                            "customer_deploy claim has no customer_owner; can't dispatch owner-update"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = self.dispatch_owner_update(&issue, &mut claim).await {
+                        warn!(issue = issue.number, error = %e, "dispatch_owner_update failed; will retry");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn dispatch_node_boot(&self, issue: &github::Issue, claim: &mut Claim) -> Result<()> {
+        let inputs = build_boot_inputs(claim).context("build boot inputs")?;
+        self.github
+            .dispatch_workflow(
+                &self.cfg.ops_repo,
+                &self.cfg.ops_boot_workflow,
+                &self.cfg.ops_ref,
+                &inputs,
+            )
+            .await
+            .context("dispatch_workflow boot-agent")?;
+        claim.state = ClaimState::NodeAssignmentStarted;
+        let comment = format!(
+            "Dispatched `{}` on `{}` @ ref `{}`; waiting for the workflow to provision a dd-agent.",
+            self.cfg.ops_boot_workflow, self.cfg.ops_repo, self.cfg.ops_ref,
+        );
+        self.transition(issue, claim, ClaimState::Active, &comment)
+            .await
+    }
+
+    async fn dispatch_owner_update(&self, issue: &github::Issue, claim: &mut Claim) -> Result<()> {
+        // These unwraps are guarded at the call site
+        // (process_node_assignment_started) but keep the helper
+        // self-contained for future re-use.
+        let agent_host = claim
+            .agent_hostname
+            .clone()
+            .context("dispatch_owner_update: agent_hostname unset")?;
+        let agent_owner = claim
+            .customer_owner
+            .clone()
+            .context("dispatch_owner_update: customer_owner unset")?;
+        let inputs = build_owner_update_inputs(&claim.claim_id, &agent_host, &agent_owner);
+        self.github
+            .dispatch_workflow(
+                &self.cfg.ops_repo,
+                &self.cfg.ops_owner_workflow,
+                &self.cfg.ops_ref,
+                &inputs,
+            )
+            .await
+            .context("dispatch_workflow owner-update")?;
+        claim.state = ClaimState::OwnerUpdateDispatched;
+        let comment = format!(
+            "Dispatched `{}` on `{}` @ ref `{}` (agent_host=`{agent_host}`, agent_owner=`{agent_owner}`).",
+            self.cfg.ops_owner_workflow, self.cfg.ops_repo, self.cfg.ops_ref,
+        );
+        self.transition(issue, claim, ClaimState::NodeAssignmentStarted, &comment)
+            .await
     }
 
     async fn transition(
