@@ -571,7 +571,7 @@ async fn node_boot(
     let claim = Claim::from_issue_body(&issue.body)
         .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
 
-    let inputs = build_boot_inputs(&claim)?;
+    let inputs = build_boot_inputs(&claim).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let workflow = state.cfg.ops_boot_workflow.clone();
     let ref_ = state.cfg.ops_ref.clone();
     let ops_repo = state.cfg.ops_repo.clone();
@@ -625,7 +625,7 @@ async fn node_boot(
 /// ```
 pub fn build_boot_inputs(
     claim: &Claim,
-) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let mut inputs = serde_json::Map::new();
     inputs.insert("claim_id".into(), claim.claim_id.clone().into());
     inputs.insert(
@@ -648,9 +648,7 @@ pub fn build_boot_inputs(
         ClaimMode::Confidential => {
             let repo = claim.workload_repo.as_deref().unwrap_or("");
             if repo.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "confidential claim missing workload_repo on manifest".into(),
-                ));
+                anyhow::bail!("confidential claim missing workload_repo on manifest");
             }
             inputs.insert("workload_repo".into(), repo.into());
             inputs.insert(
@@ -969,10 +967,11 @@ mod tests {
                 pending_timeout_secs: 10_800,
             },
         );
-        match build_boot_inputs(&c) {
-            Err(ApiError::BadRequest(m)) => assert!(m.contains("workload_repo")),
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
+        let err = build_boot_inputs(&c).unwrap_err();
+        assert!(
+            err.to_string().contains("workload_repo"),
+            "expected workload_repo in error, got {err}"
+        );
     }
 
     #[test]
