@@ -6,7 +6,7 @@
   },
   "cmd": ["/var/lib/easyenclave/bin/satsforcompute"],
   "env": [
-    "SATS_PORT=8080",
+    "SATS_PORT=8090",
     "SATS_STATE_REPO=${SATS_STATE_REPO}",
     "SATS_CODE_REPO=satsforcompute/satsforcompute",
     "SATS_DD_CP_URL=https://app.devopsdefender.com",
@@ -18,5 +18,5 @@
     "SATS_PENDING_TIMEOUT_SECS=10800",
     "RUST_LOG=satsforcompute=info"
   ],
-  "expose": { "hostname_label": "bot", "port": 8080 }
+  "expose": { "hostname_label": "bot", "port": 8090 }
 }

@@ -10,8 +10,10 @@ use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// HTTP listen port. Default 8080 to match the dd-agent default
-    /// so the operator workload can reuse the same `expose` shape.
+    /// HTTP listen port. Default 8090 (NOT 8080: dd-agent itself
+    /// listens on localhost:8080 inside the host, and the workload's
+    /// `expose` ingress would otherwise route `bot.<agent>` traffic to
+    /// dd-agent instead of the bot).
     pub port: u16,
     /// State repo for claim issues, e.g. `myorg/s4c-ops`. Public
     /// for demo, private for production. Configurable so forking
@@ -68,7 +70,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let port = parse_env("SATS_PORT", "8080")?;
+        let port = parse_env("SATS_PORT", "8090")?;
         let state_repo = require_env("SATS_STATE_REPO")?;
         let code_repo = std::env::var("SATS_CODE_REPO")
             .unwrap_or_else(|_| "satsforcompute/satsforcompute".into());
