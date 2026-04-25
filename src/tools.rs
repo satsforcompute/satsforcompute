@@ -460,7 +460,7 @@ async fn btc_invoice(
         .get_issue(&state.cfg.state_repo, req.issue_number)
         .await
         .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
-    let claim = Claim::from_issue_body(&issue.body)
+    let mut claim = Claim::from_issue_body(&issue.body)
         .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
 
     // Total cost = single-block price × number of blocks. checked_mul
@@ -491,6 +491,49 @@ async fn btc_invoice(
         label = percent_encode(label),
         message = percent_encode(&message),
     );
+
+    // Advance state Requested → InvoiceCreated on first invoice. The
+    // orchestrator's process_invoice_created scans claims at that
+    // exact label, so without this transition the BTC watcher never
+    // sees the customer's payment. Re-invoicing (top-ups) on a claim
+    // that's already in InvoiceCreated or further is a no-op here —
+    // we just regenerate the URI without churning state.
+    if matches!(claim.state, ClaimState::Requested) {
+        claim.state = ClaimState::InvoiceCreated;
+        let body = claim.to_issue_body();
+        state
+            .github
+            .update_issue_body(&state.cfg.state_repo, req.issue_number, &body)
+            .await
+            .map_err(|e| ApiError::Upstream(format!("github update_issue_body: {e}")))?;
+        // 404 on the old label is fine (already removed by hand).
+        state
+            .github
+            .remove_label(&state.cfg.state_repo, req.issue_number, "state:requested")
+            .await
+            .ok();
+        state
+            .github
+            .add_labels(
+                &state.cfg.state_repo,
+                req.issue_number,
+                &["state:invoice-created"],
+            )
+            .await
+            .ok();
+        state
+            .github
+            .add_comment(
+                &state.cfg.state_repo,
+                req.issue_number,
+                &format!(
+                    "Generated BIP21 invoice for {amount_sats} sats ({} block(s)). State: `requested` → `invoice_created`. The orchestrator will now watch the address for payment.",
+                    req.blocks
+                ),
+            )
+            .await
+            .ok();
+    }
 
     Ok(Json(BtcInvoiceResp {
         address: claim.btc.address,
