@@ -130,6 +130,10 @@ mod tests {
             pending_timeout_secs: 10_800,
             github_token: "test-token".into(),
             tool_api_token: "test-tool-token".into(),
+            ops_repo: "operator/sats-ops-actuator".into(),
+            ops_boot_workflow: "boot-agent.yml".into(),
+            ops_owner_workflow: "owner-update.yml".into(),
+            ops_ref: "main".into(),
         }
     }
 

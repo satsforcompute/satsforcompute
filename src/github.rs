@@ -270,6 +270,51 @@ impl Client {
         Ok(())
     }
 
+    /// `POST /repos/{owner}/{repo}/actions/workflows/{file}/dispatches` —
+    /// fire a `workflow_dispatch` event with typed inputs. 204 No
+    /// Content on success; the API never returns the run ID, so
+    /// callers track which run "owns" the dispatch via the inputs they
+    /// embedded (e.g. claim_id) and a follow-up listing if needed.
+    ///
+    /// `inputs` keys must match the workflow file's `inputs:` block.
+    /// All values are sent as strings — that's how `workflow_dispatch`
+    /// inputs work on the wire even when the workflow declares them as
+    /// boolean/number; the receiving workflow coerces.
+    pub async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow_filename: &str,
+        ref_name: &str,
+        inputs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            #[serde(rename = "ref")]
+            ref_: &'a str,
+            inputs: &'a serde_json::Map<String, serde_json::Value>,
+        }
+        let url = self.url(&format!(
+            "/repos/{repo}/actions/workflows/{workflow_filename}/dispatches"
+        ));
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.headers())
+            .json(&Req {
+                ref_: ref_name,
+                inputs,
+            })
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            bail!("POST {url} → {s}: {txt}");
+        }
+        Ok(())
+    }
+
     /// `DELETE /repos/{owner}/{repo}/issues/{number}/labels/{name}` —
     /// remove a single label. 404 is treated as success (GitHub
     /// returns it when the label isn't present).
