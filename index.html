@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sats for Compute &mdash; pay sats, get attested compute</title>
+  <meta name="description" content="Pay BTC, get a fresh TDX-attested DevOpsDefender node bound to your GitHub identity — or a sealed oracle from your public workload repo. Forkable example operator.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="hex-band" aria-hidden="true">
+  <span>62 69 74 63 6f 69 6e 3a 62 63 31 71 ... 70 72 69 63 65 3d 35 30 30 30 30 73 61 74 73 ... 32 34 68 20 6f 66 20 61 74 74 65 73 74 65 64 20 63 6f 6d 70 75 74 65</span>
+</div>
+
+<header>
+  <a href="/" class="brand">
+    <span class="dot">&bull;</span> sats for compute
+  </a>
+  <nav>
+    <a href="#what">what you get</a>
+    <a href="#how">how it works</a>
+    <a href="#pricing">pricing</a>
+    <a href="#verify">verify</a>
+    <a href="#fork">fork</a>
+    <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">github</a>
+  </nav>
+</header>
+
+<section class="hero">
+  <h1>
+    Pay sats.<br>
+    <span class="accent">Get attested&nbsp;compute.</span>
+  </h1>
+  <p class="lede">
+    No credit card. No KYC. No middleman. Send bitcoin, get a fresh
+    TDX-attested DevOpsDefender node bound to your GitHub identity
+    &mdash; or a sealed oracle from your public workload repo. The
+    seal is provable from outside.
+  </p>
+  <div class="cta">
+    <a href="#how" class="btn primary">Open a claim &nbsp;&rarr;</a>
+    <a href="https://devopsdefender.com" class="btn ghost" target="_blank">What's the seal?</a>
+  </div>
+  <p class="proof">
+    <span class="muted">canonical operator at</span>
+    <code>satsforcompute.com</code> &middot;
+    <span class="ok">forkable</span> &middot;
+    <span class="muted">MIT</span>
+  </p>
+</section>
+
+<section id="what">
+  <h2>What you get.</h2>
+  <p>
+    One <strong>50,000-sat</strong> payment buys 24 hours on a fresh
+    confidential VM. Pick the mode that matches what you&rsquo;re
+    running:
+  </p>
+  <div class="modes">
+    <div class="mode mode-customer">
+      <span class="mode-tag">customer deploy</span>
+      <h3>Bring your own workload</h3>
+      <p>
+        Your GitHub OIDC identity is bound to a fresh agent via
+        <code>POST /owner</code>. You get full <code>/deploy</code>,
+        <code>/exec</code>, <code>/logs</code>, and a
+        browser-shell &mdash; the same surface DD ops uses, scoped
+        to your org for the duration of the claim.
+      </p>
+      <p class="dim">For: dev shells, GPU jobs, any general-purpose compute.</p>
+    </div>
+    <div class="mode mode-confidential">
+      <span class="mode-tag">confidential</span>
+      <h3>Sealed oracle</h3>
+      <p>
+        We boot the agent in confidential mode and deploy your
+        <code>workload.json</code> from a public GitHub repo you
+        specify. <code>/deploy</code>, <code>/exec</code>, and
+        <code>/owner</code> aren&rsquo;t registered. Nobody (not us,
+        not you) can change the running code post-boot. The TDX
+        quote proves it.
+      </p>
+      <p class="dim">For: oracles, bot-oracles, any provable-by-third-party workload.</p>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <h2>How it works.</h2>
+  <ol class="steps">
+    <li>
+      <span class="num">01</span>
+      <div>
+        <h3>Open a claim</h3>
+        <p>
+          Call the tool API, get back a Claim manifest + the GitHub
+          issue number that tracks your purchase end-to-end.
+        </p>
+        <pre class="code"><span class="comment"># customer-deploy mode:</span>
+curl -X POST https://bot.satsforcompute.com/tools/claim.create \
+  -H <span class="str">"Authorization: Bearer $TOK"</span> \
+  -d <span class="str">'{"mode":"customer_deploy","customer_owner":"alice"}'</span>
+
+<span class="comment"># confidential mode:</span>
+curl -X POST https://bot.satsforcompute.com/tools/claim.create \
+  -H <span class="str">"Authorization: Bearer $TOK"</span> \
+  -d <span class="str">'{"mode":"confidential","workload_repo":"alice/my-oracle"}'</span></pre>
+      </div>
+    </li>
+    <li>
+      <span class="num">02</span>
+      <div>
+        <h3>Pay the invoice</h3>
+        <p>
+          Get a BIP21 URI for your wallet. Paste it; pay 50,000 sats.
+          The <code>message=</code> field carries your claim id so
+          your wallet shows what you&rsquo;re paying for.
+        </p>
+        <pre class="code">curl -X POST https://bot.satsforcompute.com/tools/btc.invoice \
+  -H <span class="str">"Authorization: Bearer $TOK"</span> \
+  -d <span class="str">'{"issue_number": 42}'</span>
+
+<span class="comment"># &rarr; { "bip21_uri": "bitcoin:bc1q...?amount=0.00050000&...",</span>
+<span class="comment">#       "amount_sats": 50000, ... }</span></pre>
+      </div>
+    </li>
+    <li>
+      <span class="num">03</span>
+      <div>
+        <h3>Watch the issue auto-progress</h3>
+        <p>
+          The bot polls mempool.space every 30 seconds. As soon as
+          your tx hits the mempool the claim flips to
+          <code>btc_mempool_seen</code>; on 1-conf it goes
+          <code>active</code>. Your agent&rsquo;s public hostname is
+          posted to the issue. Top-ups extend the clock.
+        </p>
+      </div>
+    </li>
+  </ol>
+</section>
+
+<section id="pricing">
+  <h2>Pricing.</h2>
+  <p>
+    Flat. Honest. No tiers.
+  </p>
+  <table class="pricing">
+    <tr>
+      <td><strong>50,000 sats</strong></td>
+      <td>One 24-hour block on a fresh confidential VM.</td>
+    </tr>
+    <tr>
+      <td><span class="muted">+50,000 sats</span></td>
+      <td>Each additional 24 hours. Top up before <code>paid_until</code> and time stacks.</td>
+    </tr>
+    <tr>
+      <td><span class="muted">0-conf</span></td>
+      <td>Optimistic activation: as soon as your tx hits the mempool, the agent is yours. 1-conf settles the credit.</td>
+    </tr>
+    <tr>
+      <td><span class="muted">3 hours</span></td>
+      <td>Pending window. If your tx never confirms (replaced, fee-stuck, etc.) the bot reclaims the node.</td>
+    </tr>
+  </table>
+  <p class="callout">
+    Billing lives in your claim&rsquo;s GitHub issue body as a JSON
+    manifest (schema <code>s12e.claim.v1</code>). Read it, audit it,
+    contest it &mdash; the source of truth is on-chain bitcoin and
+    on-issue manifest, not a hidden dashboard.
+  </p>
+</section>
+
+<section id="verify">
+  <h2>Verify your node.</h2>
+  <p>
+    Once your claim is <code>active</code>, the bot posts your
+    agent&rsquo;s public hostname. Three commands prove what you
+    rented:
+  </p>
+  <pre class="code"><span class="comment"># 1. The TDX quote — Intel-signed.</span>
+curl https://&lt;your-agent&gt;.devopsdefender.com/health \
+  | jq <span class="str">'.noise.quote_b64'</span>
+
+<span class="comment"># 2. The trust profile.</span>
+curl https://&lt;your-agent&gt;.devopsdefender.com/health \
+  | jq <span class="str">'{ confidential_mode, taint_reasons, fleet_owner, agent_owner }'</span>
+
+<span class="comment"># 3. (confidential mode) cross-check the workload measurement</span>
+<span class="comment">#    against your repo's commit. If it matches, your code is</span>
+<span class="comment">#    running and provably can't be changed by us.</span></pre>
+  <p class="footnote">
+    The <code>/health</code> endpoint is public &mdash; no
+    operator cooperation required. <a href="https://devopsdefender.com#verify" target="_blank">Verification details &rarr;</a>
+  </p>
+</section>
+
+<section id="fork">
+  <h2>Run your own operator.</h2>
+  <p>
+    Sats for Compute is a forkable example. The bot is open source,
+    the substrate (DevOpsDefender) is open source, and the spec lives
+    next to the code.
+  </p>
+  <ul>
+    <li>
+      <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">satsforcompute/satsforcompute</a>
+      &middot; the bot &mdash; tool API, lifecycle orchestrator, BTC
+      watcher, GitHub-issue state
+    </li>
+    <li>
+      <a href="https://github.com/devopsdefender/dd" target="_blank">devopsdefender/dd</a>
+      &middot; the substrate &mdash; TDX agents, control plane, CF
+      Access auth, attestation
+    </li>
+    <li>
+      <a href="https://github.com/devopsdefender/dd/blob/main/SATS_FOR_COMPUTE_SPEC.md" target="_blank">SATS_FOR_COMPUTE_SPEC.md</a>
+      &middot; the design doc behind both
+    </li>
+  </ul>
+</section>
+
+<section class="cta-section">
+  <h2>Open a claim.</h2>
+  <p>The bot is at <code>bot.satsforcompute.com</code>. The proof is one <code>curl</code> away.</p>
+  <div class="cta">
+    <a href="https://github.com/satsforcompute/satsforcompute#getting-started" class="btn primary" target="_blank">Get started &nbsp;&rarr;</a>
+    <a href="https://devopsdefender.com" class="btn ghost" target="_blank">What's the seal?</a>
+  </div>
+</section>
+
+<footer>
+  <div class="hex-band footer-band" aria-hidden="true">
+    <span>70 61 79 2d 73 61 74 73 20 7c 20 67 65 74 2d 6e 6f 64 65 20 7c 20 76 65 72 69 66 79 2d 71 75 6f 74 65 20 7c 20 66 6f 72 6b 2d 6f 70 65 72 61 74 6f 72</span>
+  </div>
+  <div class="foot-row">
+    <span class="brand"><span class="dot">&bull;</span> sats for compute</span>
+    <span class="links">
+      <a href="https://github.com/satsforcompute/satsforcompute" target="_blank">satsforcompute</a>
+      <a href="https://devopsdefender.com" target="_blank">devopsdefender</a>
+      <a href="https://github.com/easyenclave/easyenclave" target="_blank">easyenclave</a>
+    </span>
+    <span class="muted">MIT &middot; built on DevOpsDefender</span>
+  </div>
+</footer>
+
+</body>
+</html>
