@@ -48,14 +48,20 @@ Inputs (all strings; coerce as needed inside the workflow):
 ### `owner-update.yml`
 
 Dispatched after a customer-deploy claim's boot workflow has populated
-`agent_hostname` on the manifest. The workflow is responsible for:
+`agent_hostname` on the manifest. The workflow is responsible for one
+thing:
 
-1. Calling DD's `/owner` endpoint on the agent (or the equivalent
-   workflow_dispatch flow) so `agent_owner = customer_owner` —
-   transferring `/deploy` / `/exec` / `/logs` / ttyd authority to the
-   customer's GitHub identity.
-2. Calling `claim.update` on the bot to set `state = active` once the
-   binding is confirmed.
+- Mint a GitHub Actions OIDC token and POST it to the dd-agent's
+  `/owner` endpoint to set `agent_owner = customer_owner` (or to clear
+  it on revoke — see below). dd-agent's `set_owner` is fleet-gated, so
+  the workflow's repo MUST be a trusted issuer for the dd fleet
+  (`DD_OWNER`).
+
+The workflow does **not** write claim state back. The bot's
+`tick_owner_update_dispatched` polls `/health.agent_owner` and
+advances `OwnerUpdateDispatched → Active` itself once the binding
+lands. (Earlier v0 had the workflow flip state directly; that's
+resolved.)
 
 Inputs:
 
@@ -63,7 +69,14 @@ Inputs:
 | ---            | ---                                  |
 | `claim_id`     | `claim_1745678901_a1b2c3d4`          |
 | `agent_host`   | `dd-agent-7.devopsdefender.com`      |
-| `agent_owner`  | `alice`                              |
+| `agent_owner`  | `alice` — or empty string to revoke  |
+
+`agent_owner=""` is a valid input: it tells the workflow to clear the
+runtime tenant (POST `/owner` with empty body to dd-agent, which
+resets `agent_owner` to `None` so only the fleet operator can call
+`/deploy`/`/exec`). The bot dispatches with empty `agent_owner` when
+its optimistic-bind reaper fires, so the workflow MUST handle that
+case rather than failing on missing-input validation.
 
 ## Idempotency contract
 
@@ -82,15 +95,6 @@ re-dispatches. To handle that cleanly:
 In practice: query your provisioning system by `claim_id` first; act
 only if no node exists yet.
 
-## State-ownership wart (v0)
-
-The orchestrator owns most state transitions, but `owner-update.yml`
-is asked to write `state = active` itself once the binding lands.
-That's because the orchestrator can't observe agent owner state from
-the manifest alone; it would need to query the agent's `/health`. For
-v0 the workflow does it. A future change can move this to a polling
-loop on `/health.agent_owner` and revert the workflow to data-only.
-
 ## Worked example: canonical operator (`satsforcompute/sats-ops`)
 
 The canonical operator's stub workflows ship at
@@ -100,11 +104,13 @@ The canonical operator's stub workflows ship at
   `agent_id`/`agent_hostname` back via `claim.update`. Real
   provisioning is operator-specific; the stub is enough to drive the
   state machine end-to-end.
-- `owner-update.yml` — same pattern; echoes inputs and writes
-  `state = active` back via `claim.update`.
+- `owner-update.yml` — mints a GitHub Actions OIDC token (audience
+  `dd-agent`) and POSTs to the target dd-agent's `/owner` endpoint.
+  No callback to the bot; `claim.tick` advances `OwnerUpdateDispatched
+  → Active` once `/health.agent_owner` reflects the binding.
 
-Production operators replace the bodies with real provisioning +
-real DD `/owner` calls. The contract above doesn't change.
+Production operators replace `boot-agent.yml` with real cloud
+provisioning. `owner-update.yml` is already real.
 
 ## Auth from the workflow back to the bot
 

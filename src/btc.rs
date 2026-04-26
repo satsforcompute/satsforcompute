@@ -1,47 +1,36 @@
 //! Bitcoin payment watcher.
 //!
-//! v0 ships a single [`MempoolSpace`] adapter (https://mempool.space).
-//! Bitcoin Core RPC + Electrum + self-hosted mempool.space land later.
+//! [`MempoolSpace`] is the only [`BtcWatcher`] impl: it talks to
+//! `https://mempool.space` REST against mainnet or signet. There is
+//! no regtest / mock backend — integration tests run against real
+//! signet via the same adapter.
 //!
-//! Pluggability is achieved by swapping the concrete struct held in
-//! the bot's axum state; we don't pay the trait-object tax until
-//! there's a second implementation. The methods below are stable
-//! enough that a future trait extraction will be mechanical.
+//! What the bot needs from BTC:
 //!
-//! What the bot needs:
+//! - "List all txs that paid this address" (confirmed + mempool) →
+//!   [`BtcWatcher::list_address_txs`].
+//! - "What's the chain tip?" → [`BtcWatcher::current_block_height`].
+//!   Pair with [`AddressTx::confirmations`] to count confs.
 //!
-//! - "List all txs that paid this claim's address" → [`MempoolSpace::
-//!   list_address_txs`]. Used by the per-claim payment poll.
-//! - "How many confirmations does this tx have?" → derived from the
-//!   tx's block height + the chain tip ([`MempoolSpace::current_block_height`]).
-//!
-//! RBF / double-spend detection is a follow-up; v0 treats the
-//! mempool-seen → 1-conf path as a one-way ratchet and reconciles via
-//! the manual-review refund flow if a tx never confirms.
-//!
-//! Spec: SATS_FOR_COMPUTE_SPEC.md "BTC Watcher" section.
+//! RBF / double-spend detection is out of scope: the bot treats the
+//! mempool-seen → 1-conf path as a one-way ratchet and reconciles
+//! lost payments via the manual-review refund flow.
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde::Deserialize;
 
-const DEFAULT_BASE_URL: &str = "https://mempool.space/api";
+const DEFAULT_MEMPOOL_BASE_URL: &str = "https://mempool.space/api";
 
 /// One transaction observed paying into a tracked address.
 #[derive(Debug, Clone)]
 pub struct AddressTx {
     pub txid: String,
-    /// Sats received at the watched address by this tx (sum of all
-    /// outputs whose `scriptpubkey_address` matches). Inputs spent
-    /// from the address are not subtracted — the bot only watches
-    /// addresses that belong to its own derived chain, so spends are
-    /// the bot's own sweeps and don't count as customer payments.
+    /// Sats received at the watched address by this tx.
     pub received_sats: u64,
-    /// `Some(height)` if the tx is confirmed; `None` while it's still
-    /// in the mempool. Pair with [`MempoolSpace::current_block_height`]
-    /// to compute confirmation count.
+    /// `Some(height)` if confirmed; `None` while still in the mempool.
     pub block_height: Option<u64>,
-    /// Unix seconds at which the block including this tx was mined.
-    /// `None` while unconfirmed.
+    /// Unix seconds the block was mined. `None` while unconfirmed.
     pub block_time: Option<u64>,
 }
 
@@ -55,6 +44,14 @@ impl AddressTx {
     }
 }
 
+#[async_trait]
+pub trait BtcWatcher: Send + Sync {
+    async fn list_address_txs(&self, address: &str) -> Result<Vec<AddressTx>>;
+    async fn current_block_height(&self) -> Result<u64>;
+}
+
+// ── mempool.space adapter ─────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct MempoolSpace {
     http: reqwest::Client,
@@ -63,7 +60,7 @@ pub struct MempoolSpace {
 
 impl MempoolSpace {
     pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_BASE_URL)
+        Self::with_base_url(DEFAULT_MEMPOOL_BASE_URL)
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
@@ -72,12 +69,17 @@ impl MempoolSpace {
             base_url: base_url.into(),
         }
     }
+}
 
-    /// `GET /api/address/{address}/txs` — returns up to 50 mempool
-    /// txs plus the first 25 confirmed txs touching the address.
-    /// More than enough for a per-claim address that only sees one
-    /// (or a small number of top-up) payments.
-    pub async fn list_address_txs(&self, address: &str) -> Result<Vec<AddressTx>> {
+impl Default for MempoolSpace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl BtcWatcher for MempoolSpace {
+    async fn list_address_txs(&self, address: &str) -> Result<Vec<AddressTx>> {
         let url = format!(
             "{}/address/{}/txs",
             self.base_url.trim_end_matches('/'),
@@ -94,13 +96,14 @@ impl MempoolSpace {
             let body = resp.text().await.unwrap_or_default();
             bail!("GET {url} → {s}: {body}");
         }
-        let raw: Vec<RawTx> = resp.json().await.with_context(|| format!("parse {url}"))?;
-        Ok(raw.into_iter().map(|tx| project_tx(tx, address)).collect())
+        let raw: Vec<MempoolRawTx> = resp.json().await.with_context(|| format!("parse {url}"))?;
+        Ok(raw
+            .into_iter()
+            .map(|tx| project_mempool_tx(tx, address))
+            .collect())
     }
 
-    /// `GET /api/blocks/tip/height` — current chain-tip height. Pair
-    /// with [`AddressTx::confirmations`].
-    pub async fn current_block_height(&self) -> Result<u64> {
+    async fn current_block_height(&self) -> Result<u64> {
         let url = format!("{}/blocks/tip/height", self.base_url.trim_end_matches('/'));
         let resp = self
             .http
@@ -120,31 +123,23 @@ impl MempoolSpace {
     }
 }
 
-impl Default for MempoolSpace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Wire types ────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize)]
-struct RawTx {
+struct MempoolRawTx {
     txid: String,
     #[serde(default)]
-    vout: Vec<RawVout>,
-    status: RawStatus,
+    vout: Vec<MempoolRawVout>,
+    status: MempoolRawStatus,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawVout {
+struct MempoolRawVout {
     #[serde(default)]
     scriptpubkey_address: Option<String>,
     value: u64,
 }
 
 #[derive(Debug, Deserialize)]
-struct RawStatus {
+struct MempoolRawStatus {
     confirmed: bool,
     #[serde(default)]
     block_height: Option<u64>,
@@ -152,7 +147,7 @@ struct RawStatus {
     block_time: Option<u64>,
 }
 
-fn project_tx(raw: RawTx, target_address: &str) -> AddressTx {
+fn project_mempool_tx(raw: MempoolRawTx, target_address: &str) -> AddressTx {
     let received_sats: u64 = raw
         .vout
         .iter()
@@ -175,9 +170,7 @@ fn project_tx(raw: RawTx, target_address: &str) -> AddressTx {
 mod tests {
     use super::*;
 
-    fn fixture_two_outputs_one_match() -> RawTx {
-        // Synthesized after the public mempool.space response shape
-        // — kept in code so the test doesn't need a network round-trip.
+    fn fixture_two_outputs_one_match() -> MempoolRawTx {
         let json = r#"{
             "txid": "abc123",
             "version": 2,
@@ -199,7 +192,7 @@ mod tests {
     #[test]
     fn project_sums_only_matching_outputs() {
         let raw = fixture_two_outputs_one_match();
-        let tx = project_tx(raw, "bc1qme");
+        let tx = project_mempool_tx(raw, "bc1qme");
         assert_eq!(tx.txid, "abc123");
         assert_eq!(tx.received_sats, 51_000);
         assert_eq!(tx.block_height, Some(850123));
@@ -214,8 +207,8 @@ mod tests {
             "vout": [{ "scriptpubkey_address": "bc1qme", "value": 50000 }],
             "status": { "confirmed": false }
         }"#;
-        let raw: RawTx = serde_json::from_str(json).unwrap();
-        let tx = project_tx(raw, "bc1qme");
+        let raw: MempoolRawTx = serde_json::from_str(json).unwrap();
+        let tx = project_mempool_tx(raw, "bc1qme");
         assert_eq!(tx.block_height, None);
         assert_eq!(tx.confirmations(900_000), 0);
     }
@@ -230,15 +223,11 @@ mod tests {
         };
         assert_eq!(tx.confirmations(850_000), 1);
         assert_eq!(tx.confirmations(850_005), 6);
-        // tip < block_height should never happen in practice; treat
-        // as 0 rather than panic on subtraction.
         assert_eq!(tx.confirmations(800_000), 0);
     }
 
     #[test]
     fn project_ignores_outputs_with_no_address() {
-        // OP_RETURN outputs have no scriptpubkey_address — must skip
-        // them rather than count as 0-sats matching.
         let json = r#"{
             "txid": "with_op_return",
             "vin": [],
@@ -248,8 +237,8 @@ mod tests {
             ],
             "status": { "confirmed": false }
         }"#;
-        let raw: RawTx = serde_json::from_str(json).unwrap();
-        let tx = project_tx(raw, "bc1qme");
+        let raw: MempoolRawTx = serde_json::from_str(json).unwrap();
+        let tx = project_mempool_tx(raw, "bc1qme");
         assert_eq!(tx.received_sats, 50_000);
     }
 }

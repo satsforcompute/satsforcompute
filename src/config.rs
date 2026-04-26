@@ -1,9 +1,6 @@
 //! Environment-derived configuration.
 //!
-//! All operator-tunable values live here. Forking operators set these
-//! at deploy time (typically as GitHub Actions secrets baked into the
-//! enclave's config disk). No runtime mutation.
-//!
+//! Operator-tunable values, set at deploy time. No runtime mutation.
 //! See `SATS_FOR_COMPUTE_SPEC.md` for the canonical name of each knob.
 
 use anyhow::{Context, Result, bail};
@@ -15,48 +12,12 @@ pub struct Config {
     /// `expose` ingress would otherwise route `bot.<agent>` traffic to
     /// dd-agent instead of the bot).
     pub port: u16,
-    /// State repo for claim issues, e.g. `myorg/s4c-ops`. Public
-    /// for demo, private for production. Configurable so forking
-    /// operators don't share state.
+    /// State repo for claim issues, e.g. `myorg/s4c-ops`.
     pub state_repo: String,
-    /// Optional code repo (public). Just for self-reference in
-    /// claim-comment links.
-    pub code_repo: String,
-    /// DevOpsDefender control-plane URL the operator uses to boot
-    /// new agents and dispatch /owner workflows on. Defaults to
-    /// the canonical `app.devopsdefender.com`.
-    pub dd_cp_url: String,
-    /// Operator's BTC sweep address (cold storage). The `wallet.
-    /// sweep_cold` tool only sends here. Public addresses are not
-    /// secrets in the crypto sense, but routing through a GitHub
-    /// secret keeps the address out of the repo + CI logs and makes
-    /// rotation trivial when the exchange cycles a deposit address.
-    pub sweep_address: String,
-    /// Price per 24-hour claim block, in sats. Spec ships with
-    /// 50,000 (~$30/day). Operator-configurable.
-    pub price_per_24h_sats: u64,
-    /// Time the optimistic 0-conf activation stays "pending" before
-    /// the bot gives up and reclaims the node. Spec recommendation:
-    /// 3 hours (vs the original 1h, which fee-market congestion
-    /// false-terminates).
-    pub pending_timeout_secs: u64,
-    /// GitHub bearer token. Either a fine-grained PAT (quickstart) or
-    /// a GitHub App installation token (production). Provides
-    /// read+write on the configured `state_repo`'s issues, comments,
-    /// and labels — see `github.rs` for the exact REST surface used.
-    /// Held only in process memory; never logged.
-    pub github_token: String,
-    /// Shared bearer token gating the `/tools/*` API. Operator
-    /// frontends (OpenClaw, custom UI, etc.) present it as
-    /// `Authorization: Bearer <token>`. Single token per operator
-    /// for v0; multi-tenant tool-API auth (per-frontend tokens) is a
-    /// future cleanup.
-    pub tool_api_token: String,
-    /// `owner/repo` of the operator-ops repo holding privileged
-    /// workflows the bot dispatches via `workflow_dispatch`. The
-    /// ops repo is what actually does cloud provisioning + DD
-    /// `/owner` calls; the bot itself never holds those creds.
-    /// See `OPS_REPO.md` for the workflow contract.
+    /// Operator-ops repo holding privileged workflows the bot fires
+    /// via `workflow_dispatch`. The ops repo is what actually does
+    /// cloud provisioning + DD `/owner` calls; the bot itself never
+    /// holds those creds. See `OPS_REPO.md` for the workflow contract.
     pub ops_repo: String,
     /// Filename of the boot-agent workflow inside `ops_repo`.
     /// Defaults to `boot-agent.yml`.
@@ -66,14 +27,51 @@ pub struct Config {
     pub ops_owner_workflow: String,
     /// Git ref the dispatched workflows run from. Default `main`.
     pub ops_ref: String,
+    /// DevOpsDefender control-plane URL. Default `app.devopsdefender.com`.
+    pub dd_cp_url: String,
+    /// Operator's BTC sweep / invoice address. v0 stub: every claim
+    /// invoices into this single address. Per-claim derivation lands
+    /// with the BDK enclave wallet.
+    pub sweep_address: String,
+    /// Price per 24-hour claim block, in sats. Default 50,000.
+    pub price_per_24h_sats: u64,
+    /// Pending-payment grace window in seconds. Carried on each
+    /// claim's `BtcDetails` per spec `s12e.claim.v1`. Default 10800.
+    pub pending_timeout_secs: u64,
+    /// GitHub bearer token (PAT or app installation token). Read+write
+    /// on `state_repo` issues + `ops_repo` dispatches.
+    pub github_token: String,
+    /// Shared bearer token gating `/tools/*`.
+    pub tool_api_token: String,
+    /// Optional bearer token the bot presents to dd-agent's `/health`
+    /// when polling for `agent_owner` flip. Cloudflare zero-trust
+    /// fronts dd-agents in production, so a service token may be
+    /// required. Empty / unset = no auth header.
+    pub dd_auth_token: Option<String>,
+    /// `mempool.space` REST base URL. Defaults to mainnet
+    /// (`https://mempool.space/api`); set `SATS_MEMPOOL_BASE_URL` to
+    /// e.g. `https://mempool.space/signet/api` for the signet
+    /// integration test.
+    pub mempool_base_url: String,
+    /// How long to wait after an optimistic 0-conf
+    /// `dd.dispatch_owner_update` before reaping the claim if the
+    /// underlying tx still hasn't reached `required_confirmations`.
+    /// Default 3600s (1h). On reap, the bot dispatches owner-update
+    /// with an empty `agent_owner` to revoke access and transitions
+    /// the claim to `failed`.
+    pub optimistic_bind_grace_secs: u64,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         let port = parse_env("SATS_PORT", "8090")?;
         let state_repo = require_env("SATS_STATE_REPO")?;
-        let code_repo = std::env::var("SATS_CODE_REPO")
-            .unwrap_or_else(|_| "satsforcompute/satsforcompute".into());
+        let ops_repo = require_env("SATS_OPS_REPO")?;
+        let ops_boot_workflow =
+            std::env::var("SATS_OPS_BOOT_WORKFLOW").unwrap_or_else(|_| "boot-agent.yml".into());
+        let ops_owner_workflow =
+            std::env::var("SATS_OPS_OWNER_WORKFLOW").unwrap_or_else(|_| "owner-update.yml".into());
+        let ops_ref = std::env::var("SATS_OPS_REF").unwrap_or_else(|_| "main".into());
         let dd_cp_url = std::env::var("SATS_DD_CP_URL")
             .unwrap_or_else(|_| "https://app.devopsdefender.com".into());
         let sweep_address = require_env("SATS_SWEEP_ADDRESS")?;
@@ -81,12 +79,12 @@ impl Config {
         let pending_timeout_secs = parse_env("SATS_PENDING_TIMEOUT_SECS", "10800")?;
         let github_token = require_env("SATS_GITHUB_TOKEN")?;
         let tool_api_token = require_env("SATS_TOOL_API_TOKEN")?;
-        let ops_repo = require_env("SATS_OPS_REPO")?;
-        let ops_boot_workflow =
-            std::env::var("SATS_OPS_BOOT_WORKFLOW").unwrap_or_else(|_| "boot-agent.yml".into());
-        let ops_owner_workflow =
-            std::env::var("SATS_OPS_OWNER_WORKFLOW").unwrap_or_else(|_| "owner-update.yml".into());
-        let ops_ref = std::env::var("SATS_OPS_REF").unwrap_or_else(|_| "main".into());
+        let dd_auth_token = std::env::var("SATS_DD_AUTH_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let mempool_base_url = std::env::var("SATS_MEMPOOL_BASE_URL")
+            .unwrap_or_else(|_| "https://mempool.space/api".into());
+        let optimistic_bind_grace_secs = parse_env("SATS_OPTIMISTIC_BIND_GRACE_SECS", "3600")?;
 
         if !state_repo.contains('/') {
             bail!("SATS_STATE_REPO must be 'owner/repo', got {state_repo:?}");
@@ -101,17 +99,19 @@ impl Config {
         Ok(Self {
             port,
             state_repo,
-            code_repo,
+            ops_repo,
+            ops_boot_workflow,
+            ops_owner_workflow,
+            ops_ref,
             dd_cp_url,
             sweep_address,
             price_per_24h_sats,
             pending_timeout_secs,
             github_token,
             tool_api_token,
-            ops_repo,
-            ops_boot_workflow,
-            ops_owner_workflow,
-            ops_ref,
+            dd_auth_token,
+            mempool_base_url,
+            optimistic_bind_grace_secs,
         })
     }
 }
@@ -138,9 +138,6 @@ mod tests {
 
     #[test]
     fn parse_env_falls_back_to_default() {
-        // Not setting the var; default kicks in.
-        // We don't synchronize env access here — `SATS_PORT_TEST_X`
-        // is unique per test name, so cross-test contention is nil.
         let v: u16 = parse_env("SATS_PORT_TEST_FALLBACK", "9999").unwrap();
         assert_eq!(v, 9999);
     }

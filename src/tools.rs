@@ -23,21 +23,21 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     routing::post,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
-use crate::claim::{BtcDetails, CURRENT_SCHEMA, Claim, ClaimMode, ClaimState};
+use crate::btc::BtcWatcher;
+use crate::claim::{BtcDetails, CURRENT_SCHEMA, Claim, ClaimMode, ClaimState, TaintReason};
 use crate::config::Config;
 use crate::github;
 
-/// Shared state threaded into every tool handler. The github client
-/// is `Arc`-wrapped because it carries the long-lived reqwest pool
-/// and a copy of the operator's bearer token; we never hand it out
-/// to end-users.
+/// Shared state threaded into every tool handler.
 #[derive(Clone)]
 pub struct State_ {
     pub cfg: Arc<Config>,
     pub github: Arc<github::Client>,
+    pub btc: Arc<dyn BtcWatcher>,
 }
 
 pub fn router(state: State_) -> Router {
@@ -45,6 +45,7 @@ pub fn router(state: State_) -> Router {
         .route("/tools/claim.create", post(claim_create))
         .route("/tools/claim.load", post(claim_load))
         .route("/tools/claim.update", post(claim_update))
+        .route("/tools/claim.tick", post(claim_tick))
         .route("/tools/btc.invoice", post(btc_invoice))
         .route("/tools/node.boot", post(node_boot))
         .route(
@@ -113,16 +114,20 @@ async fn claim_create(
     }
 
     let claim_id = generate_claim_id();
+    // STUB: until the BDK enclave workload exists, every claim shares
+    // one operator address. Disambiguate payments by baking a per-
+    // claim LSD signature into the price — the customer pays an
+    // exact, slightly-perturbed amount and the watcher matches by
+    // amount instead of by address. 1..=9999 sat range gives 9999
+    // distinct invoice amounts; collision odds at typical operator
+    // scale are negligible. Per-claim address derivation lands when
+    // the wallet workload is wired.
+    let lsd = (rand_suffix() % 9999) as u64 + 1;
+    let exact_amount_sats = state.cfg.price_per_24h_sats + lsd;
     let btc = BtcDetails {
-        // STUB: until the BDK enclave workload exists, every claim
-        // gets the operator's sweep address as its "invoice address."
-        // Per-claim address derivation lands when the wallet workload
-        // is wired (or, in dev, when the user's backed-up xpub is
-        // configured — see CLAUDE.md). Single-address mode means the
-        // bot has to attribute payments by amount + time + the
-        // BIP21 message field rather than by address.
         address: state.cfg.sweep_address.clone(),
         price_per_24h_sats: state.cfg.price_per_24h_sats,
+        exact_amount_sats,
         required_confirmations: 1,
         pending_timeout_secs: state.cfg.pending_timeout_secs,
     };
@@ -385,27 +390,381 @@ fn label_state_slug(s: &str) -> String {
 }
 
 /// Stringify `ClaimState` to the same snake_case form serde produces.
-/// Centralized so labels and JSON stay in sync.
+/// Centralized in `claim::state_str`; re-exported here to avoid
+/// changing existing call sites.
 fn state_str(s: ClaimState) -> &'static str {
-    match s {
-        ClaimState::Requested => "requested",
-        ClaimState::InvoiceCreated => "invoice_created",
-        ClaimState::BtcMempoolSeen => "btc_mempool_seen",
-        ClaimState::NodeAssignmentStarted => "node_assignment_started",
-        ClaimState::OwnerUpdateDispatched => "owner_update_dispatched",
-        ClaimState::ActivePendingConfirmation => "active_pending_confirmation",
-        ClaimState::BtcConfirmed => "btc_confirmed",
-        ClaimState::Active => "active",
-        ClaimState::Overdue => "overdue",
-        ClaimState::Shutdown => "shutdown",
-        ClaimState::PaymentFailed => "payment_failed",
-        ClaimState::BootFailed => "boot_failed",
-        ClaimState::OwnerUpdateFailed => "owner_update_failed",
-        ClaimState::AttestationFailed => "attestation_failed",
-        ClaimState::ShutdownFailed => "shutdown_failed",
-        ClaimState::NodeFailed => "node_failed",
-        ClaimState::ManualReview => "manual_review",
+    crate::claim::state_str(s)
+}
+
+// ── claim.tick ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimTickReq {
+    pub issue_number: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimTickResp {
+    pub previous_state: String,
+    pub new_state: String,
+    pub state_changed: bool,
+    pub note: String,
+    pub claim: Claim,
+}
+
+/// Advance one claim by one step. Idempotent: a tick that has nothing
+/// to advance (no payment yet, not enough confs, agent_owner not yet
+/// reflected) is a no-op and reports `state_changed = false`. The
+/// caller drives the cadence — there is no background loop.
+async fn claim_tick(
+    State(state): State<State_>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimTickReq>,
+) -> Result<Json<ClaimTickResp>, ApiError> {
+    require_tool_token(&headers, &state.cfg.tool_api_token)?;
+
+    let issue = state
+        .github
+        .get_issue(&state.cfg.state_repo, req.issue_number)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
+    let mut claim = Claim::from_issue_body(&issue.body)
+        .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
+
+    let prev = state_str(claim.state);
+    let (advanced, note) = match claim.state {
+        ClaimState::InvoiceCreated => tick_invoice_created(&state, &mut claim).await?,
+        ClaimState::BtcMempoolSeen => tick_btc_mempool_seen(&state, &mut claim).await?,
+        ClaimState::OwnerUpdateDispatched => {
+            // Reaper takes precedence: if the optimistic 0-conf bind
+            // never settled within the grace window, fail-close.
+            if let Some(r) = maybe_reap_or_settle_optimistic(&state, &mut claim).await? {
+                r
+            } else {
+                tick_owner_update_dispatched(&state, &mut claim).await?
+            }
+        }
+        ClaimState::Active => {
+            // Active is the happy-path terminal — but two reapers can
+            // still fire: the optimistic-bind reaper (if the tx never
+            // settled within grace) takes precedence; otherwise the
+            // end-of-block reaper checks `paid_until` and revokes
+            // when the 24h window elapses.
+            if let Some(r) = maybe_reap_or_settle_optimistic(&state, &mut claim).await? {
+                r
+            } else if let Some(r) = maybe_reap_overdue(&state, &mut claim).await? {
+                r
+            } else {
+                (false, "active; no automatic transition".into())
+            }
+        }
+        // Other states are externally driven (`Requested` awaits
+        // btc.invoice; `BtcConfirmed` awaits dd.dispatch_owner_update;
+        // `Failed` is terminal). No-op.
+        _ => (false, format!("no automatic transition from `{prev}`")),
+    };
+
+    if advanced {
+        let new = state_str(claim.state);
+        let body = claim.to_issue_body();
+        state
+            .github
+            .update_issue_body(&state.cfg.state_repo, req.issue_number, &body)
+            .await
+            .map_err(|e| ApiError::Upstream(format!("github update_issue_body: {e}")))?;
+        let old_label = format!("state:{}", label_state_slug(prev));
+        let new_label = format!("state:{}", label_state_slug(new));
+        state
+            .github
+            .remove_label(&state.cfg.state_repo, req.issue_number, &old_label)
+            .await
+            .ok();
+        state
+            .github
+            .add_labels(&state.cfg.state_repo, req.issue_number, &[&new_label])
+            .await
+            .ok();
+        let _ = state
+            .github
+            .add_comment(
+                &state.cfg.state_repo,
+                req.issue_number,
+                &format!("Tick: `{prev}` → `{new}` ({note})"),
+            )
+            .await;
+        info!(
+            issue = req.issue_number,
+            from = prev,
+            to = new,
+            "tick: advanced"
+        );
     }
+
+    let new_state = state_str(claim.state);
+    Ok(Json(ClaimTickResp {
+        previous_state: prev.into(),
+        new_state: new_state.into(),
+        state_changed: advanced,
+        note,
+        claim,
+    }))
+}
+
+async fn tick_invoice_created(
+    state: &State_,
+    claim: &mut Claim,
+) -> Result<(bool, String), ApiError> {
+    let txs = state
+        .btc
+        .list_address_txs(&claim.btc.address)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("btc list_address_txs: {e}")))?;
+    let needed = claim.btc.exact_amount_sats;
+    let already = claim.billing.last_payment_txid.as_deref();
+    // Exact match: the LSD-perturbed amount is the bot's per-claim
+    // signature. A tx that pays anything else (over- or under-) is
+    // not this customer's payment and gets ignored — manual review.
+    let Some(tx) = txs
+        .iter()
+        .find(|t| t.received_sats == needed && already != Some(&t.txid))
+    else {
+        return Ok((
+            false,
+            format!("no tx paying exactly {needed} sats to the invoice address yet"),
+        ));
+    };
+    claim.state = ClaimState::BtcMempoolSeen;
+    claim.billing.last_payment_txid = Some(tx.txid.clone());
+    Ok((
+        true,
+        format!(
+            "saw tx `{}` paying exactly {} sats",
+            tx.txid, tx.received_sats
+        ),
+    ))
+}
+
+async fn tick_btc_mempool_seen(
+    state: &State_,
+    claim: &mut Claim,
+) -> Result<(bool, String), ApiError> {
+    let Some(txid) = claim.billing.last_payment_txid.clone() else {
+        return Ok((false, "no last_payment_txid recorded".into()));
+    };
+    let txs = state
+        .btc
+        .list_address_txs(&claim.btc.address)
+        .await
+        .map_err(|e| ApiError::Upstream(format!("btc list_address_txs: {e}")))?;
+    let Some(tx) = txs.iter().find(|t| t.txid == txid) else {
+        return Ok((false, format!("tx `{txid}` not visible to watcher")));
+    };
+    let tip = state
+        .btc
+        .current_block_height()
+        .await
+        .map_err(|e| ApiError::Upstream(format!("btc current_block_height: {e}")))?;
+    let confs = tx.confirmations(tip);
+    if confs < claim.btc.required_confirmations {
+        return Ok((
+            false,
+            format!(
+                "tx `{txid}` at {confs}/{required} confs",
+                required = claim.btc.required_confirmations
+            ),
+        ));
+    }
+    claim.state = ClaimState::BtcConfirmed;
+    Ok((true, format!("tx `{txid}` reached {confs} conf")))
+}
+
+async fn tick_owner_update_dispatched(
+    state: &State_,
+    claim: &mut Claim,
+) -> Result<(bool, String), ApiError> {
+    let Some(host) = claim.agent_hostname.as_deref() else {
+        return Ok((
+            false,
+            "no agent_hostname on claim; the boot workflow has not written one back yet".into(),
+        ));
+    };
+    let Some(expected_owner) = claim.customer_owner.as_deref() else {
+        return Ok((
+            false,
+            "claim has no customer_owner to match against agent_owner".into(),
+        ));
+    };
+    let health = fetch_dd_health(host, state.cfg.dd_auth_token.as_deref())
+        .await
+        .map_err(|e| ApiError::Upstream(format!("dd-agent /health: {e}")))?;
+    let agent_owner = health.agent_owner.as_deref().unwrap_or("");
+    if agent_owner != expected_owner {
+        return Ok((
+            false,
+            format!("agent_owner=`{agent_owner}`; waiting for `{expected_owner}`"),
+        ));
+    }
+    claim.state = ClaimState::Active;
+    claim.integrity.confidential_mode = health.confidential_mode;
+    claim.integrity.taint_reasons = health.taint_reasons;
+    Ok((
+        true,
+        format!("dd-agent `{host}` reports agent_owner=`{agent_owner}`"),
+    ))
+}
+
+/// Settle-or-reap the optimistic 0-conf bind. Returns:
+///
+/// - `None` — claim wasn't optimistically bound, or grace window still
+///   open with the tx still unsettled. Caller proceeds with the
+///   normal tick handler.
+/// - `Some((true, note))` — optimistic flag was cleared (settled) or
+///   the claim was reaped (failed). Caller persists the new state.
+/// - Errors are returned only on workflow-dispatch failure during a
+///   reap; BTC-watcher failures degrade silently to "no settle/reap"
+///   so a flaky upstream can't fail-close a customer.
+async fn maybe_reap_or_settle_optimistic(
+    state: &State_,
+    claim: &mut Claim,
+) -> Result<Option<(bool, String)>, ApiError> {
+    let Some(bound_at) = claim.billing.optimistic_bind_at else {
+        return Ok(None);
+    };
+
+    // Did the tx eventually confirm? Fail-open on watcher errors:
+    // we'd rather wait one more tick than wrongfully reap a paying
+    // customer because mempool.space hiccupped.
+    let confirmed = if let Some(txid) = claim.billing.last_payment_txid.clone() {
+        match (
+            state.btc.list_address_txs(&claim.btc.address).await,
+            state.btc.current_block_height().await,
+        ) {
+            (Ok(txs), Ok(tip)) => txs
+                .iter()
+                .find(|t| t.txid == txid)
+                .map(|t| t.confirmations(tip) >= claim.btc.required_confirmations)
+                .unwrap_or(false),
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    if confirmed {
+        claim.billing.optimistic_bind_at = None;
+        return Ok(Some((
+            true,
+            "optimistic 0-conf bind settled at required confs; cleared flag".into(),
+        )));
+    }
+
+    let elapsed = (Utc::now() - bound_at).num_seconds().max(0) as u64;
+    if elapsed < state.cfg.optimistic_bind_grace_secs {
+        return Ok(None);
+    }
+
+    // Grace elapsed and still unsettled: reap. Best-effort revoke
+    // by dispatching owner-update with an empty `agent_owner`
+    // (dd-agent /owner clears the runtime owner on empty input).
+    let agent_host = claim.agent_hostname.clone().unwrap_or_default();
+    let reap_note = if agent_host.is_empty() {
+        format!(
+            "reaped: optimistic 0-conf bind unsettled after {elapsed}s; no agent_hostname recorded so revoke skipped (state → `failed`, manual review)"
+        )
+    } else {
+        let inputs = build_owner_update_inputs(&claim.claim_id, &agent_host, "");
+        state
+            .github
+            .dispatch_workflow(
+                &state.cfg.ops_repo,
+                &state.cfg.ops_owner_workflow,
+                &state.cfg.ops_ref,
+                &inputs,
+            )
+            .await
+            .map_err(|e| ApiError::Upstream(format!("dispatch_workflow reap: {e}")))?;
+        format!(
+            "reaped: optimistic 0-conf bind unsettled after {elapsed}s; dispatched owner-update with empty agent_owner on `{agent_host}` to revoke (state → `failed`)"
+        )
+    };
+    claim.state = ClaimState::Failed;
+    claim.billing.optimistic_bind_at = None;
+    Ok(Some((true, reap_note)))
+}
+
+/// End-of-block reaper. Returns `Some((true, note))` when the
+/// `paid_until` window has elapsed and the claim was reaped; `None`
+/// otherwise. Same revoke mechanism as the optimistic reaper —
+/// dispatch owner-update with empty `agent_owner` and transition to
+/// `Failed`. Intended only for `Active` claims (the dispatch handler
+/// sets `paid_until` at the moment of bind).
+async fn maybe_reap_overdue(
+    state: &State_,
+    claim: &mut Claim,
+) -> Result<Option<(bool, String)>, ApiError> {
+    let Some(paid_until) = claim.billing.paid_until else {
+        return Ok(None);
+    };
+    let now = Utc::now();
+    if now < paid_until {
+        return Ok(None);
+    }
+
+    let elapsed_secs = (now - paid_until).num_seconds().max(0);
+    let agent_host = claim.agent_hostname.clone().unwrap_or_default();
+    let reap_note = if agent_host.is_empty() {
+        format!(
+            "reaped: paid_until elapsed {elapsed_secs}s ago; no agent_hostname recorded so revoke skipped (state → `failed`, manual review)"
+        )
+    } else {
+        let inputs = build_owner_update_inputs(&claim.claim_id, &agent_host, "");
+        state
+            .github
+            .dispatch_workflow(
+                &state.cfg.ops_repo,
+                &state.cfg.ops_owner_workflow,
+                &state.cfg.ops_ref,
+                &inputs,
+            )
+            .await
+            .map_err(|e| ApiError::Upstream(format!("dispatch_workflow reap: {e}")))?;
+        format!(
+            "reaped: paid_until elapsed {elapsed_secs}s ago; dispatched owner-update with empty agent_owner on `{agent_host}` to revoke (state → `failed`)"
+        )
+    };
+    claim.state = ClaimState::Failed;
+    Ok(Some((true, reap_note)))
+}
+
+#[derive(Debug, Deserialize)]
+struct DdHealth {
+    #[serde(default)]
+    agent_owner: Option<String>,
+    #[serde(default)]
+    confidential_mode: bool,
+    #[serde(default)]
+    taint_reasons: Vec<TaintReason>,
+}
+
+async fn fetch_dd_health(
+    hostname: &str,
+    auth_token: Option<&str>,
+) -> Result<DdHealth, anyhow::Error> {
+    let base = hostname.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let mut req = reqwest::Client::new().get(&url);
+    if let Some(tok) = auth_token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "GET {url} → {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+    Ok(resp.json::<DdHealth>().await?)
 }
 
 // ── btc.invoice ───────────────────────────────────────────────────
@@ -440,6 +799,9 @@ pub struct BtcInvoiceResp {
     /// payments to claims via the wallet's own tx history.
     pub message: String,
     pub blocks: u32,
+    /// New claim state after this call. `invoice_created` for a fresh
+    /// claim; unchanged otherwise (top-up paths leave state alone).
+    pub state: String,
 }
 
 async fn btc_invoice(
@@ -463,17 +825,19 @@ async fn btc_invoice(
     let mut claim = Claim::from_issue_body(&issue.body)
         .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
 
-    // Total cost = single-block price × number of blocks. checked_mul
-    // so a malicious or misconfigured frontend can't overflow u64
-    // and surprise the wallet.
+    // Total cost = exact-amount-per-block × number of blocks. The
+    // exact amount carries this claim's per-claim LSD signature so
+    // the watcher can attribute the incoming tx by amount alone (every
+    // claim shares one operator address in v0). checked_mul guards
+    // against u64 overflow on a malicious or misconfigured frontend.
     let amount_sats = claim
         .btc
-        .price_per_24h_sats
+        .exact_amount_sats
         .checked_mul(req.blocks as u64)
         .ok_or_else(|| {
             ApiError::BadRequest(format!(
-                "blocks={} × price_per_24h_sats={} overflows u64",
-                req.blocks, claim.btc.price_per_24h_sats
+                "blocks={} × exact_amount_sats={} overflows u64",
+                req.blocks, claim.btc.exact_amount_sats
             ))
         })?;
     let amount_btc = format_btc(amount_sats);
@@ -542,6 +906,7 @@ async fn btc_invoice(
         bip21_uri,
         message,
         blocks: req.blocks,
+        state: state_str(claim.state).into(),
     }))
 }
 
@@ -655,6 +1020,7 @@ async fn node_boot(
 ///     BtcDetails {
 ///         address: "bc1q-x".into(),
 ///         price_per_24h_sats: 50_000,
+///         exact_amount_sats: 50_127,
 ///         required_confirmations: 1,
 ///         pending_timeout_secs: 10_800,
 ///     },
@@ -738,7 +1104,7 @@ async fn dd_dispatch_owner_update(
         .get_issue(&state.cfg.state_repo, req.issue_number)
         .await
         .map_err(|e| ApiError::Upstream(format!("github get_issue: {e}")))?;
-    let claim = Claim::from_issue_body(&issue.body)
+    let mut claim = Claim::from_issue_body(&issue.body)
         .map_err(|e| ApiError::Upstream(format!("issue body manifest: {e}")))?;
 
     // Fail-closed: confidential mode has no /owner route on the agent
@@ -751,17 +1117,25 @@ async fn dd_dispatch_owner_update(
         ));
     }
 
-    // Caller may override; otherwise read from the manifest the boot
-    // workflow wrote back.
-    let agent_host = req
+    // Caller may override agent_host; otherwise read from the manifest
+    // the boot workflow wrote back. Cache the override onto the claim
+    // so claim.tick (polling /health on this host) finds it.
+    let req_agent_host = req
         .agent_host
+        .as_deref()
         .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let agent_host = req_agent_host
+        .clone()
         .or_else(|| claim.agent_hostname.clone())
         .ok_or_else(|| {
             ApiError::BadRequest(
                 "agent_host required (none on request and none on claim manifest)".into(),
             )
         })?;
+    if claim.agent_hostname.as_deref() != Some(agent_host.as_str()) {
+        claim.agent_hostname = Some(agent_host.clone());
+    }
     let agent_owner = claim.customer_owner.clone().ok_or_else(|| {
         ApiError::BadRequest(
             "claim.customer_owner is unset; can't dispatch owner-update without an owner".into(),
@@ -778,6 +1152,73 @@ async fn dd_dispatch_owner_update(
         .dispatch_workflow(&ops_repo, &workflow, &ref_, &inputs)
         .await
         .map_err(|e| ApiError::Upstream(format!("dispatch_workflow owner-update: {e}")))?;
+
+    // Advance state: BtcMempoolSeen | BtcConfirmed → OwnerUpdateDispatched.
+    // Optimistic 0-conf path (BtcMempoolSeen) records `optimistic_bind_at`
+    // so claim.tick can reap the claim if the underlying tx never settles.
+    // Idempotent for callers re-dispatching from a later state (no churn).
+    if matches!(
+        claim.state,
+        ClaimState::BtcMempoolSeen | ClaimState::BtcConfirmed
+    ) {
+        let prev = state_str(claim.state);
+        let optimistic = claim.state == ClaimState::BtcMempoolSeen;
+        claim.state = ClaimState::OwnerUpdateDispatched;
+        if optimistic {
+            claim.billing.optimistic_bind_at = Some(Utc::now());
+        }
+        // Single 24h block (multi-block top-ups out of scope for v0).
+        // `get_or_insert_with` so a re-dispatch (e.g. after a transient
+        // failure) doesn't slide the deadline forward.
+        claim
+            .billing
+            .paid_until
+            .get_or_insert_with(|| Utc::now() + Duration::hours(24));
+        let body = claim.to_issue_body();
+        state
+            .github
+            .update_issue_body(&state.cfg.state_repo, req.issue_number, &body)
+            .await
+            .map_err(|e| ApiError::Upstream(format!("github update_issue_body: {e}")))?;
+        let old_label = format!("state:{}", label_state_slug(prev));
+        let new_label = format!("state:{}", label_state_slug(state_str(claim.state)));
+        state
+            .github
+            .remove_label(&state.cfg.state_repo, req.issue_number, &old_label)
+            .await
+            .ok();
+        state
+            .github
+            .add_labels(&state.cfg.state_repo, req.issue_number, &[&new_label])
+            .await
+            .ok();
+        let conf_note = if optimistic {
+            " (optimistic 0-conf bind; tx must settle within grace window)"
+        } else {
+            ""
+        };
+        let _ = state
+            .github
+            .add_comment(
+                &state.cfg.state_repo,
+                req.issue_number,
+                &format!(
+                    "Dispatched `{workflow}` on `{ops_repo}` for `{agent_host}` (owner=`{agent_owner}`). State: `{prev}` → `owner_update_dispatched`{conf_note}."
+                ),
+            )
+            .await;
+    } else if let Some(host) = req_agent_host.as_deref()
+        && claim.agent_hostname.as_deref() == Some(host)
+    {
+        // Re-dispatched on a claim already past BtcConfirmed; agent_host
+        // override may still need to land on the manifest.
+        let body = claim.to_issue_body();
+        state
+            .github
+            .update_issue_body(&state.cfg.state_repo, req.issue_number, &body)
+            .await
+            .ok();
+    }
 
     Ok(Json(DdDispatchOwnerUpdateResp {
         claim_id: claim.claim_id,
@@ -934,27 +1375,17 @@ mod tests {
 
     #[test]
     fn state_str_round_trips_with_serde() {
-        // Every variant of ClaimState the spec lists. If serde's
-        // snake_case rename and our `state_str` ever drift, this test
-        // catches it before claim.update mislabels an issue.
+        // Every variant of ClaimState. If serde's snake_case rename
+        // and our `state_str` ever drift, this test catches it before
+        // claim.update mislabels an issue.
         for st in [
             ClaimState::Requested,
             ClaimState::InvoiceCreated,
             ClaimState::BtcMempoolSeen,
-            ClaimState::NodeAssignmentStarted,
-            ClaimState::OwnerUpdateDispatched,
-            ClaimState::ActivePendingConfirmation,
             ClaimState::BtcConfirmed,
+            ClaimState::OwnerUpdateDispatched,
             ClaimState::Active,
-            ClaimState::Overdue,
-            ClaimState::Shutdown,
-            ClaimState::PaymentFailed,
-            ClaimState::BootFailed,
-            ClaimState::OwnerUpdateFailed,
-            ClaimState::AttestationFailed,
-            ClaimState::ShutdownFailed,
-            ClaimState::NodeFailed,
-            ClaimState::ManualReview,
+            ClaimState::Failed,
         ] {
             let via_serde = serde_json::to_value(st).unwrap();
             assert_eq!(via_serde, state_str(st));
@@ -1006,6 +1437,7 @@ mod tests {
             BtcDetails {
                 address: "bc1q-x".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -1025,6 +1457,7 @@ mod tests {
             BtcDetails {
                 address: "bc1q-x".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -1050,6 +1483,7 @@ mod tests {
             BtcDetails {
                 address: "bc1q-x".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
