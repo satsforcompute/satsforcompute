@@ -53,26 +53,30 @@ pub struct Claim {
     pub integrity: Integrity,
 }
 
+/// The claim's position in its happy-path lifecycle, plus a single
+/// terminal `Failed` for any error. Order is the order transitions
+/// fire; states are not skipped except into `Failed`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimState {
+    /// Issue created; no invoice yet.
     Requested,
+    /// `btc.invoice` returned a BIP21 URI; bot is watching the address.
     InvoiceCreated,
+    /// A tx ≥ price was seen in the mempool against the invoice address.
     BtcMempoolSeen,
-    NodeAssignmentStarted,
-    OwnerUpdateDispatched,
-    ActivePendingConfirmation,
+    /// The seen tx reached `required_confirmations`.
     BtcConfirmed,
+    /// `node.dd_dispatch_owner_update` triggered a workflow_dispatch on
+    /// the operator-ops repo. Bot is waiting for the agent's `agent_owner`
+    /// to flip to the customer.
+    OwnerUpdateDispatched,
+    /// dd-agent `/health.agent_owner` matches `claim.customer_owner` —
+    /// the customer has access. Terminal happy state for v0.
     Active,
-    Overdue,
-    Shutdown,
-    PaymentFailed,
-    BootFailed,
-    OwnerUpdateFailed,
-    AttestationFailed,
-    ShutdownFailed,
-    NodeFailed,
-    ManualReview,
+    /// Any unrecoverable error. Operator review required; refund decided
+    /// out-of-band.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,8 +96,28 @@ pub enum ClaimMode {
 pub struct BtcDetails {
     pub address: String,
     pub price_per_24h_sats: u64,
+    /// Exact sat amount the customer must pay per 24h block. Equal to
+    /// `price_per_24h_sats + lsd_signature`, where the LSD is a small
+    /// per-claim secret (1..=9999) the bot bakes at claim creation.
+    /// Since every claim shares one operator address (v0 stub), a
+    /// unique payment amount is what lets the watcher attribute an
+    /// incoming tx to the right claim. Treat as semi-private — the
+    /// BIP21 URI exposes it to the customer but it isn't broadcast in
+    /// claim labels or summaries.
+    pub exact_amount_sats: u64,
     pub required_confirmations: u32,
+    /// Grace window between invoice creation and the bot abandoning
+    /// the unconfirmed payment. Carried in the canonical manifest per
+    /// `s12e.claim.v1` even though this rewrite has no autonomous
+    /// reclaimer that reads it — external schedulers may use it.
+    /// Default at claim creation is `SATS_PENDING_TIMEOUT_SECS` (or
+    /// 10800 = 3h).
+    #[serde(default = "default_pending_timeout_secs")]
     pub pending_timeout_secs: u64,
+}
+
+fn default_pending_timeout_secs() -> u64 {
+    10_800
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +135,14 @@ pub struct Billing {
     /// can link back to the on-chain proof. Cleared on top-up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_payment_txid: Option<String>,
+    /// Set when `dd.dispatch_owner_update` fires before the payment
+    /// reached `required_confirmations` (optimistic 0-conf bind).
+    /// Cleared once the tx settles. If the grace window elapses with
+    /// the tx still unsettled, `claim.tick` reaps the claim (state
+    /// → `failed`, owner-update dispatched with empty owner to
+    /// revoke agent access).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimistic_bind_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +196,7 @@ impl Claim {
                 paid_until: None,
                 uncredited_sats: 0,
                 last_payment_txid: None,
+                optimistic_bind_at: None,
             },
             integrity: Integrity {
                 confidential_mode: matches!(mode, ClaimMode::Confidential),
@@ -272,25 +305,17 @@ pub enum ManifestError {
     Parse(#[from] serde_json::Error),
 }
 
-fn state_str(s: ClaimState) -> &'static str {
+/// Stringify `ClaimState` to the snake_case form serde produces.
+/// Centralized so labels and JSON stay in sync.
+pub fn state_str(s: ClaimState) -> &'static str {
     match s {
         ClaimState::Requested => "requested",
         ClaimState::InvoiceCreated => "invoice_created",
         ClaimState::BtcMempoolSeen => "btc_mempool_seen",
-        ClaimState::NodeAssignmentStarted => "node_assignment_started",
-        ClaimState::OwnerUpdateDispatched => "owner_update_dispatched",
-        ClaimState::ActivePendingConfirmation => "active_pending_confirmation",
         ClaimState::BtcConfirmed => "btc_confirmed",
+        ClaimState::OwnerUpdateDispatched => "owner_update_dispatched",
         ClaimState::Active => "active",
-        ClaimState::Overdue => "overdue",
-        ClaimState::Shutdown => "shutdown",
-        ClaimState::PaymentFailed => "payment_failed",
-        ClaimState::BootFailed => "boot_failed",
-        ClaimState::OwnerUpdateFailed => "owner_update_failed",
-        ClaimState::AttestationFailed => "attestation_failed",
-        ClaimState::ShutdownFailed => "shutdown_failed",
-        ClaimState::NodeFailed => "node_failed",
-        ClaimState::ManualReview => "manual_review",
+        ClaimState::Failed => "failed",
     }
 }
 
@@ -313,6 +338,7 @@ mod tests {
             BtcDetails {
                 address: "bc1qtest".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -332,6 +358,7 @@ mod tests {
             BtcDetails {
                 address: "bc1qx".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -354,6 +381,7 @@ mod tests {
             BtcDetails {
                 address: "bc1qroundtrip".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -389,6 +417,7 @@ mod tests {
             BtcDetails {
                 address: "bc1qsealed".into(),
                 price_per_24h_sats: 50_000,
+                exact_amount_sats: 50_127,
                 required_confirmations: 1,
                 pending_timeout_secs: 10_800,
             },
@@ -434,10 +463,12 @@ mod tests {
     fn claim_state_transitions_round_trip() {
         for state in [
             ClaimState::Requested,
+            ClaimState::InvoiceCreated,
+            ClaimState::BtcMempoolSeen,
+            ClaimState::BtcConfirmed,
+            ClaimState::OwnerUpdateDispatched,
             ClaimState::Active,
-            ClaimState::Overdue,
-            ClaimState::ManualReview,
-            ClaimState::NodeFailed,
+            ClaimState::Failed,
         ] {
             let s = serde_json::to_string(&state).unwrap();
             let back: ClaimState = serde_json::from_str(&s).unwrap();

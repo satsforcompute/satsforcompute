@@ -1,13 +1,14 @@
 //! HTTP front of the operator bot.
 //!
-//! v0 surface:
+//! Surface:
 //!
-//! - `GET /healthz` — liveness for ops + the dd-agent's deploy
-//!   verification step.
-//! - `GET /version` — build-time identifier so a third-party verifier
-//!   can correlate /health with a specific commit.
-//! - `POST /tools/<name>` — operator tool API (auth-gated, see
-//!   `tools::router`). First tool is `claim.create`.
+//! - `GET /healthz` — liveness + config summary for ops verification.
+//! - `GET /version` — build identifier so a verifier can correlate
+//!   `/healthz` with a specific commit.
+//! - `POST /tools/<name>` — operator tool API (bearer-auth, see
+//!   `tools::router`). Tools: `claim.create`, `btc.invoice`,
+//!   `claim.tick`, `claim.load`, `claim.update`, `node.boot`,
+//!   `dd.dispatch_owner_update`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,11 +18,10 @@ use axum::{Json, Router, http::StatusCode, routing::get};
 use serde::Serialize;
 use tracing::info;
 
-use crate::btc::MempoolSpace;
+use crate::btc::{self, BtcWatcher};
 use crate::claim::CURRENT_SCHEMA;
 use crate::config::Config;
 use crate::github;
-use crate::lifecycle::Lifecycle;
 use crate::tools;
 
 #[derive(Clone)]
@@ -33,21 +33,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     let port = cfg.port;
     let cfg_arc = Arc::new(cfg);
 
-    // Tool layer needs its own State_ because each tool handler reads
-    // the full config + the GitHub client. Health/version stay on a
-    // smaller AppState so they don't pull in the GitHub client.
     let github = Arc::new(github::Client::new(cfg_arc.github_token.clone()));
-    let btc = Arc::new(MempoolSpace::new());
-
-    // Spawn the lifecycle orchestrator. It runs the BTC-watch +
-    // state-transition loop in the background; the HTTP listener
-    // serves the tool API in the foreground. Both share the same
-    // GitHub client + config Arc.
-    Lifecycle::new(cfg_arc.clone(), github.clone(), btc.clone()).spawn();
+    let btc: Arc<dyn BtcWatcher> =
+        Arc::new(btc::MempoolSpace::with_base_url(&cfg_arc.mempool_base_url));
 
     let tool_state = tools::State_ {
         cfg: cfg_arc.clone(),
         github,
+        btc,
     };
 
     let app = Router::new()
@@ -71,9 +64,10 @@ struct Healthz {
     service: &'static str,
     schema: &'static str,
     state_repo: String,
+    ops_repo: String,
     sweep_address_present: bool,
     price_per_24h_sats: u64,
-    pending_timeout_secs: u64,
+    mempool_base_url: String,
 }
 
 async fn healthz(
@@ -86,12 +80,12 @@ async fn healthz(
             service: "satsforcompute",
             schema: CURRENT_SCHEMA,
             state_repo: state.cfg.state_repo.clone(),
+            ops_repo: state.cfg.ops_repo.clone(),
             // Don't echo the literal address — operators may treat
             // it as semi-private even though it's on-chain visible.
-            // Surfacing a presence flag is enough for ops liveness.
             sweep_address_present: !state.cfg.sweep_address.is_empty(),
             price_per_24h_sats: state.cfg.price_per_24h_sats,
-            pending_timeout_secs: state.cfg.pending_timeout_secs,
+            mempool_base_url: state.cfg.mempool_base_url.clone(),
         }),
     )
 }
@@ -123,17 +117,19 @@ mod tests {
         Config {
             port: 0,
             state_repo: "operator/sats-ops".into(),
-            code_repo: "satsforcompute/satsforcompute".into(),
+            ops_repo: "operator/sats-ops-actuator".into(),
+            ops_boot_workflow: "boot-agent.yml".into(),
+            ops_owner_workflow: "owner-update.yml".into(),
+            ops_ref: "main".into(),
             dd_cp_url: "https://app.devopsdefender.com".into(),
             sweep_address: "bc1q-test".into(),
             price_per_24h_sats: 50_000,
             pending_timeout_secs: 10_800,
             github_token: "test-token".into(),
             tool_api_token: "test-tool-token".into(),
-            ops_repo: "operator/sats-ops-actuator".into(),
-            ops_boot_workflow: "boot-agent.yml".into(),
-            ops_owner_workflow: "owner-update.yml".into(),
-            ops_ref: "main".into(),
+            dd_auth_token: None,
+            mempool_base_url: "https://mempool.space/api".into(),
+            optimistic_bind_grace_secs: 3600,
         }
     }
 
@@ -158,8 +154,10 @@ mod tests {
         assert_eq!(v["service"], "satsforcompute");
         assert_eq!(v["schema"], CURRENT_SCHEMA);
         assert_eq!(v["state_repo"], "operator/sats-ops");
+        assert_eq!(v["ops_repo"], "operator/sats-ops-actuator");
         assert_eq!(v["sweep_address_present"], true);
         assert_eq!(v["price_per_24h_sats"], 50_000);
+        assert_eq!(v["mempool_base_url"], "https://mempool.space/api");
     }
 
     #[tokio::test]

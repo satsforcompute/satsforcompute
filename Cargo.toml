@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -26,3 +27,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+# Signet integration test only — the test wallet broadcasts its own
+# payment so the test is fully self-driving (no manual faucet drip
+# between runs). Not a build dep: only compiled when running tests.
+bdk_wallet = "3"
+bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls"] }
+# Direct dep so we can opt into the `tokio` feature (gives us
+# `DefaultSleeper: Sleeper` for AsyncClient::broadcast). bdk_esplora
+# 0.22 doesn't pass that through.
+esplora-client = { version = "0.12", default-features = false, features = ["async-https-rustls", "tokio"] }
