@@ -86,17 +86,44 @@ curl -fsSL "https://bot.${AGENT_HOSTNAME}/healthz" | jq
 `/healthz` echoes the static config back. Confirm `state_repo`,
 `ops_repo`, `mempool_base_url` are the values you expect.
 
-## 4. CNAME `bot.satsforcompute.com`
+## 4. DNS for `satsforcompute.com` (Namecheap)
 
-To get a stable customer-facing URL:
+The zone is on Namecheap and only hosts the marketing site at the
+apex — the bot is reached directly at its dd-tunnel hostname (e.g.
+`bot-sats-for-compute.devopsdefender.com`), not through this zone.
 
-1. In your DNS (Cloudflare, route53, etc.), add a `CNAME`:
-   ```
-   bot.satsforcompute.com  CNAME  bot.<dd-local-bot-hostname>
-   ```
-2. If the dd CF tunnel is on a Cloudflare zone you also control,
-   you can use the same CF zone — see dd's CF tunnel docs.
-3. `curl -fsSL https://bot.satsforcompute.com/healthz` to verify.
+**Domain List → Manage → Advanced DNS:**
+
+| Type     | Host  | Value                                  |
+|----------|-------|----------------------------------------|
+| A Record | `@`   | `185.199.108.153`                      |
+| A Record | `@`   | `185.199.109.153`                      |
+| A Record | `@`   | `185.199.110.153`                      |
+| A Record | `@`   | `185.199.111.153`                      |
+| CNAME    | `www` | `satsforcompute.github.io.`            |
+
+Namecheap-specific gotchas:
+
+- Delete the default `URL Redirect Record` row on `@` and any
+  parking `CNAME` on `@`. They silently override the A records —
+  symptom is `dig satsforcompute.com +short` returning Namecheap's
+  parking IP (`192.64.119.143`) instead of the GitHub IPs, and
+  GitHub Pages HTTPS provisioning never completes.
+- Leave `@` as just the four A records.
+
+GitHub routes the apex to the right repo via the `CNAME` file in
+`gh-pages` (currently `satsforcompute.com`); the `www` CNAME points
+to the org subdomain, not the repo. Verify after propagation:
+
+```bash
+dig satsforcompute.com +short          # expect the four 185.199.*.153 IPs
+dig www.satsforcompute.com +short      # expect satsforcompute.github.io. + same IPs
+curl -sI https://satsforcompute.com    # expect HTTP/2 200, server: GitHub.com
+```
+
+Then in **github.com/satsforcompute/satsforcompute → Settings →
+Pages**, confirm the custom domain shows green and tick **Enforce
+HTTPS** once the cert provisions (~15 min after DNS resolves).
 
 ## 5. Configure `sats-ops`
 
@@ -106,7 +133,7 @@ The bot is up; now wire the cron + workflow callbacks to it:
 OPS=satsforcompute/sats-ops
 BOT_TOKEN="$(gh secret list --repo satsforcompute/satsforcompute | grep SATS_TOOL_API_TOKEN)"  # value: paste the same token you set in §1
 
-gh variable set BOT_URL    --repo "$OPS" --body 'https://bot.satsforcompute.com'
+gh variable set BOT_URL    --repo "$OPS" --body "https://bot.${AGENT_HOSTNAME}"   # the dd-tunnel URL from §3
 gh variable set STATE_REPO --repo "$OPS" --body 'satsforcompute/<state-repo>'
 gh secret   set BOT_TOOL_API_TOKEN --repo "$OPS" --body "<same token as §1>"
 gh secret   set STATE_GITHUB_TOKEN --repo "$OPS" --body '<PAT with read on state_repo issues>'
