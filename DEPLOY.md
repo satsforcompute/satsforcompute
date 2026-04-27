@@ -75,12 +75,14 @@ GitHub OIDC to authenticate to dd-cp and pushes the workload onto
 
 ```bash
 # Pick the assigned hostname from dd-cp.
-gh api "https://app.devopsdefender.com/api/agents" \
-  | jq -r '.[] | select(.vm_name=="dd-local-bot") | .hostname'
+AGENT=$(curl -fsSL https://app.devopsdefender.com/api/agents \
+  | jq -r '.[] | select(.vm_name=="dd-local-bot") | .hostname')
 
-# The bot's expose label is "bot"; the URL is
-# https://bot.<dd-local-bot-hostname>/healthz
-curl -fsSL "https://bot.${AGENT_HOSTNAME}/healthz" | jq
+# The expose URL format is `<agent-base>-<label>.<rest>` — i.e. the
+# label is grafted onto the LEFTMOST DNS segment, not prepended as a
+# new subdomain. See dd/src/cf.rs:160.
+BOT_HOST=$(echo "$AGENT" | sed -E 's/^([^.]+)\.(.+)$/\1-bot.\2/')
+curl -fsSL "https://${BOT_HOST}/healthz" | jq
 ```
 
 `/healthz` echoes the static config back. Confirm `state_repo`,
@@ -141,11 +143,37 @@ cargo test --test integration_signet -- --ignored --nocapture
 
 Greens means the demo is live.
 
+## Recovering after a `dd-local-bot` reboot
+
+`agent_owner` is **runtime-only** on dd-agents (per
+`dd/src/agent.rs` — "resets to `None` on reboot, so a crash/restart
+is self-healing"). For per-customer claims the bot's reaper
+re-applies; for the operator-side `Deploy bot` workflow there's no
+autonomous re-applier. So after any `virsh reset`, `virsh reboot`,
+or host reboot of `dd-local-bot`, you have to re-bind manually:
+
+```bash
+gh workflow run set-agent-owner.yml --repo devopsdefender/dd \
+  -f cp-url=https://app.devopsdefender.com \
+  -f vm-name=dd-local-bot \
+  -f agent-owner=satsforcompute
+```
+
+…then re-run `Deploy bot`. Watch for `agent_owner == "satsforcompute"`
+in `dd-cp /api/agents` (or in the agent's `/health`) before retrying
+the deploy. Also note that `virsh reboot` (ACPI) is sometimes
+ignored; `virsh reset` is the reliable forced-reboot.
+
 ## Troubleshooting
 
-- **`Deploy bot` red on `dd-deploy`**: usually `agent_owner` on
-  `dd-local-bot` doesn't match this repo's org. Re-run dd's
-  `set-agent-owner.yml` with `agent-owner=satsforcompute`.
+- **`Deploy bot` red on `dd-deploy` with HTTP 401**: `agent_owner`
+  on `dd-local-bot` doesn't match this repo's org. Re-bind via the
+  recipe above.
+- **`Deploy bot` red on `dd-deploy` with `no healthy agent with
+  vm_name=dd-local-bot`**: the agent isn't registered with dd-cp.
+  Either the VM is down (`virsh list --all` to check) or the agent's
+  registration has lapsed and it needs a fresh boot. `virsh reset
+  dd-local-bot` and wait ~45s for re-registration.
 - **`/healthz` 404**: the workload didn't deploy. Look at the
   `dd-deploy` step's logs.
 - **`claim-tick-cron` always failing red**: probably `BOT_URL` typo
